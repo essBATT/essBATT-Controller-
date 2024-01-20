@@ -1,0 +1,20 @@
+{
+    "ess_controller_state_version": 1.0,
+    "current_state": "normal_operation",
+    "time_of_last_change": "none",
+    "time_of_last_completed_balancing": "none",
+    "winter_mode": "not_activated",
+    "winter_SOC_discharge_limit": "not_activated",
+    "charge_to_SOC": {
+        "activation_time": "none",
+        "target_SOC": "none",
+        "max_current": "none",
+        "requested_current_direction": "none",
+        "scheduled_start_time": "none"
+    },
+    "balancing": {
+        "activation_time": "none",
+        "max_current": "none",
+        "scheduled_start_time": "none"
+    }
+}
