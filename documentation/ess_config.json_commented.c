@@ -109,7 +109,7 @@
         },
         "auto_balancing_settings":{
             "activate_auto_balancing": 1, // [values: 0,1] Activate or deactivate auto balancing here
-            "weekday": "Sunday", // [] Choose the weekday when autobalancing shall take place. 
+            "weekday": "Sunday", // [https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes] Choose the weekday when autobalancing shall take place. 
             "time": "12:00", //[24h time format] Auto balancing will start at this time on the set "weekday"
             "days_to_next_autobalancing": 28 // [days] Put the minimum number of days between each auto balancing here
         }
