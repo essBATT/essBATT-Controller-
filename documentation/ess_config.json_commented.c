@@ -27,7 +27,7 @@
     },
     "battery_settings":{
         "compensate_current_limit_violations": 0, // DO NOT USE - experimental (sometimes Victron violates charge or discharge limits and current flows to/from the battery even when set to zero)
-        "smooth_voltage_based_(dis)charge_limits": 1, // Special behavior for voltage based charge- and discharge limits. Needs more explanation in a seperate documentation. If a voltage based limit is reached it keeps the limit instead of loosing it when the voltage might cross the "limit voltage" again
+        "smooth_voltage_based_(dis)charge_limits": 1, // Special behavior for voltage based charge- and discharge limits. Needs more explanation in a seperate documentation. Short: If a voltage based limit is reached it keeps the limit instead of loosing it when the voltage might cross the "limit voltage" again
         "charge_limit_mode": "max_cell_only", // ["max_cell_only", "soc_only", "soc_and_max_cell"] Max cell only uses soc_based_charge_limit_soc_array and soc_based_charge_limit_current_array. soc_only uses soc_based_charge_limit_soc_array and soc_based_charge_limit_current_array. soc_and_max_cell uses both whichever condition is first met.
         "max_cell_voltage_charging": 3.56, // [volt] If the cell with the maximum voltage reaches the "max_cell_voltage_charging" threshold charging is stopped (charge current=0A).   
         "max_cell_voltage_charging_resume": 3.5, // [volt] If the cell with the maximum voltage falls below "max_cell_voltage_charging_resume" AND previously was above "max_cell_voltage_charging" (charge current = 0A), charging starts again with the set charge current limit
@@ -65,10 +65,10 @@
             1.8
         ],
         // Same as with charging only inverted. Should be self explanatory.
-        // ATTENTION: SOC and MIN CELL VOLTAGE array numbers need to be DESCENDING to not get unexpected behavior!
-        "discharge_limit_mode": "soc_and_min_cell",
-        "min_cell_voltage_discharging": 3.1,
-        "min_cell_voltage_discharging_resume": 3.25,
+        "discharge_limit_mode": "soc_and_min_cell", // ["min_cell_only", "soc_only", "soc_and_min_cell"] Same as with "charge"
+        "min_cell_voltage_discharging": 3.1, // [volt] If the cell with the minimum voltage is equal or below the "min_cell_voltage_discharging" threshold discharging is stopped (discharge current=0A).   
+        "min_cell_voltage_discharging_resume": 3.25, // [volt] If the cell with the minimum voltage rises above "min_cell_voltage_discharging_resume" AND previously was below "min_cell_voltage_discharging" (discharge current = 0A), discharging starts again with the set discharge current limit
+        // ATTENTION: SOC and MIN CELL VOLTAGE array numbers (soc_based_discharge_limit_soc_array and min_cell_based_discharge_limit_voltage_array) need to be DESCENDING to not get unexpected behavior!
         "soc_based_discharge_limit_soc_array":[
             20,
             15,
@@ -115,27 +115,28 @@
         }
     },
     "external_control_settings":{
-        "allow_external_control_over_mqtt": 1,
-        "time_format":"%H:%M",
-        "date_format":"%d.%m.%Y",
+        "allow_external_control_over_mqtt": 1, // [values: 0,1] If activated you can send MQTT commands to essBATT to charge, discharge or balance your battery pack. You can also deactivate charging and discharging seperatly or reboot the essBATT controller
+        "time_format":"%H:%M", // [https://strftime.org/] To use time based activation of "charge_battery_to_SOC" and "activate_top_balancing_mode" you can specify a time format with the linked syntax. The default time_format given here is used by the time picker in iobroker ?? GUI.
+        "date_format":"%d.%m.%Y", // [https://strftime.org/] To use time based activation of "charge_battery_to_SOC" and "activate_top_balancing_mode" you can specify a date format with the linked syntax. The default date_format given here is used by the date picker in iobroker ?? GUI.
         "mqtt_external_control_topics":{
-            "charge_battery_to_SOC": "iobroker/ESS_External_Control/activate_charge_to_SOC_command",
-            "activate_top_balancing_mode": "iobroker/ESS_External_Control/activate_balancing_command",
-            "deactivate_discharge": "iobroker/ESS_External_Control/forbid_discharging",
-            "deactivate_charge": "iobroker/ESS_External_Control/forbid_charging",
-            "reboot_ess_controller": "iobroker/ESS_External_Control/reboot"
+            "charge_battery_to_SOC": "EXAMPLE: iobroker/ESS_External_Control/activate_charge_to_SOC_command", // put the MQTT topic path where you send the commands here. See extended documentation for the format of the data you need to send
+            "activate_top_balancing_mode": "EXAMPLE: iobroker/ESS_External_Control/activate_balancing_command",  // put the MQTT topic path where you send the commands here. See extended documentation for the format of the data you need to send
+            "deactivate_discharge": "EXAMPLE: iobroker/ESS_External_Control/forbid_discharging", // put the MQTT topic path where you send the commands here. See extended documentation for the format of the data you need to send
+            "deactivate_charge": "EXAMPLE: iobroker/ESS_External_Control/forbid_charging", // put the MQTT topic path where you send the commands here. See extended documentation for the format of the data you need to send
+            "reboot_ess_controller": "EXAMPLE: iobroker/ESS_External_Control/reboot" // put the MQTT topic path where you send the commands here. See extended documentation for the format of the data you need to send
         }
     },
     "winter_mode":{
-        "use_winter_mode": 1,
-        "winter_mode_start_date": "01.11.",
-        "winter_mode_end_date": "10.03.",
-        "winter_min_SOC": 25,
-        "winter_restart_multis_SOC": 70,
-        "winter_inactive_charge_min_voltage": 3.17,
-        "winter_inactive_charge_time_minutes": 30,
+        "use_winter_mode": 1, // [values: 0,1] Activate or deactivate winter mode behavior
+        "winter_mode_start_date": "01.11.", // [DD.MM.] Set the date when essBATT controller should go into winter mode
+        "winter_mode_end_date": "10.03.", // [DD.MM.] Set the date when essBATT controller should go into normal mode
+        "winter_min_SOC": 25, // [0-100%] If the battery SOC is equal or below this value, the chargers and inverters of all attached Multis are switched off to save energy.
+        "winter_restart_multis_SOC": 70, // [0-100% but higher than winter_min_SOC] If the Multis are switched off due to winter mode (<winter_min_SOC) the battery needs to be charged above this value (e.g. by the solarchargers which could take multiple days in winter to charge the battery above this value) to restart the Multis.
+        "winter_inactive_charge_min_voltage": 3.17, // [volt] If the Multis are switched off due to winter mode and something is further draining the battery and the voltage falls below this value, the batteries are charged automatically for winter_inactive_charge_time_minutes minutes. This is done to increase the lifespan of the batteries.
+        "winter_inactive_charge_time_minutes": 30, // [minutes] Number of minutes the "Multis are inactive in winter" state is interupted to charge the batteries a bit. Fixed the charge current to a maximum of 20A but is of course limited by other settings.
+        // Same behavior as with the "normal" autobalancing. Possibility to adapt the autobalancing in winter. E.g. with an hourly electricity price tariff it is better to balance on sunday noon (because it is usually cheap then) in summer, but in Winter midnight is usually cheaper. 
         "auto_balancing_settings":{
-            "use_different_winter_settings": 1,
+            "use_different_winter_settings": 1, 
             "weekday": "Sunday",
             "time": "23:58",
             "days_to_next_autobalancing": 28
