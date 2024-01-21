@@ -1,5 +1,8 @@
 // Optimized for reading in Notepad++ with default setting. Fileending .c because comments have a readable visual format
 // Hope this also works on github
+
+// The values in this example config work for LiFePo4 cells.
+// ATTENTION: Make sure you understand each setting and adapt it to your system!!!
 {
     "config_version": 1.0, // DO NOT CHANGE! This is the version of the format of this config file.
     "ess_mode": "ess_mode_2_normal_operation", // NOT IN USE - intended to be used in later development
@@ -26,8 +29,15 @@
         "compensate_current_limit_violations": 0, // DO NOT USE - experimental (sometimes Victron violates charge or discharge limits and current flows to/from the battery even when set to zero)
         "smooth_voltage_based_(dis)charge_limits": 1, // Special behavior for voltage based charge- and discharge limits. Needs more explanation in a seperate documentation. If a voltage based limit is reached it keeps the limit instead of loosing it when the voltage might cross the "limit voltage" again
         "charge_limit_mode": "max_cell_only", // ["max_cell_only", "soc_only", "soc_and_max_cell"] Max cell only uses soc_based_charge_limit_soc_array and soc_based_charge_limit_current_array. soc_only uses soc_based_charge_limit_soc_array and soc_based_charge_limit_current_array. soc_and_max_cell uses both whichever condition is first met.
-        "max_cell_voltage_charging": 3.56,
-        "max_cell_voltage_charging_resume": 3.5,
+        "max_cell_voltage_charging": 3.56, // [volt] If the cell with the maximum voltage reaches the "max_cell_voltage_charging" threshold charging is stopped (charge current=0A).   
+        "max_cell_voltage_charging_resume": 3.5, // [volt] If the cell with the maximum voltage falls below "max_cell_voltage_charging_resume" AND previously was above "max_cell_voltage_charging" (charge current = 0A), charging starts again with the set charge current limit
+        // Use "soc_based_charge_limit_soc_array" and "soc_based_charge_limit_current_array" to limit the charge current based on the "State Of Charge" (0-100%) of the battery pack.
+        // Both arrays need to have the same number of elements, because to each number in the SOC array there needs to be a corresponding charge current in the current_array. In this example: if the battery is equal or above 80% SOC the charge current is limited to 25A. After getting
+        // over 90% SOC the charge current is limited to 10. 
+        // ATTENTION: Make sure the numbers you put here make sense because there is NO plausibility check!
+        // ATTENTION: Make sure the SOC values are in ascending order. e.g. (80,90,95) is good and (90,80,95) will lead to unexpected behavior.
+        // NOTE: You can put as many entrys/number pairs as you like into these arrays.
+        // NOTE: If these limits are applied is defined by the field "charge_limit_mode"
         "soc_based_charge_limit_soc_array":[
             80,
             90,
@@ -38,6 +48,8 @@
             10,
             5
         ],
+        // Same explanation as with the SOC based charge limit apply here.
+        // These limits are looking at the cell with the maximum voltage and set charge current limits accordingly. If your current sensor is not very good or for other reasons you do not have a good SOC estimation it makes sense to use these limits to protect your cells.
         "max_cell_based_charge_limit_voltage_array":[
             3.42,
             3.44,
@@ -52,6 +64,8 @@
             5,
             1.8
         ],
+        // Same as with charging only inverted. Should be self explanatory.
+        // ATTENTION: SOC and MIN CELL VOLTAGE array numbers need to be DESCENDING to not get unexpected behavior!
         "discharge_limit_mode": "soc_and_min_cell",
         "min_cell_voltage_discharging": 3.1,
         "min_cell_voltage_discharging_resume": 3.25,
@@ -77,23 +91,27 @@
             8,
             0
         ],
+        // Emergency charging and discharging is used to protect the cells to never get below or above the maximum cell limits (e.g. 2.5V/3.65V for LiFePo4).
+        // If a cell gets close to these maximum values for whatever reason charging/discharging is applied to bring the cell back into a more save state
         "emergency_(dis)charge":{
-            "use_emergency_(dis)charging": 1,
-            "max_cell_voltage_for_emergency_discharge": 3.63,
-            "min_cell_voltage_for_emergency_charge": 3.05,
-            "emergency_(dis)charge_duration_minutes": 10
+            "use_emergency_(dis)charging": 1, // [values: 0,1] Use or do not use this feature
+            "max_cell_voltage_for_emergency_discharge": 3.63, // [volt] If the cell with the maximum voltage gets to this value the multis will discharge the battery for "emergency_(dis)charge_duration_minutes" minutes.
+            "min_cell_voltage_for_emergency_charge": 3.05, // [volt] If the cell with the minimum voltage gets equal or below this value the multis will charge the battery for "emergency_(dis)charge_duration_minutes" minutes.
+            "emergency_(dis)charge_duration_minutes": 10 // [minutes] Number of minutes the charging takes place. (Dis-)charge current is set (fix value) to 10A.
         }
     },
+    // These settings are used if you either activated balancing over MQTT (see external_control_settings) OR if the script activated "auto balancing" (see auto_balancing_settings in normal and winter_mode). 
     "balancing_settings":{
+        // The balancing state is switched to normal operation if all of the condition below are fullfilled (connected with a logical AND)
         "balancing_complete_condition":{
-            "min_cell_voltage_threshold": 3.48,
-            "max_diff_voltage_between_min_and_max_cell": 0.01
+            "min_cell_voltage_threshold": 3.48, // [volt] If the cell with the minimum voltage gets above this value the first part of the condition is fullfilled
+            "max_diff_voltage_between_min_and_max_cell": 0.01 // [volt] If the difference between the cell with the minimum and the maximum voltage is equal or below this value the second part of the condition is fullfilled
         },
         "auto_balancing_settings":{
-            "activate_auto_balancing": 1,
-            "weekday": "Sunday",
-            "time": "12:00",
-            "days_to_next_autobalancing": 28
+            "activate_auto_balancing": 1, // [values: 0,1] Activate or deactivate auto balancing here
+            "weekday": "Sunday", // [] Choose the weekday when autobalancing shall take place. 
+            "time": "12:00", //[24h time format] Auto balancing will start at this time on the set "weekday"
+            "days_to_next_autobalancing": 28 // [days] Put the minimum number of days between each auto balancing here
         }
     },
     "external_control_settings":{
