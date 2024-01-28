@@ -1,0 +1,32 @@
+version: '3.7'
+services:
+  mosquitto:
+    image: 'eclipse-mosquitto:latest'
+    container_name: mqtt_server
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./shared_container_volumes/mosquitto/data:/mosquitto/data
+      - ./shared_container_volumes/mosquitto/log:/mosquitto/log
+      - ./shared_container_volumes/mosquitto/config:/mosquitto/config
+      - "/etc/timezone:/etc/timezone:ro"
+      - "/etc/localtime:/etc/localtime:ro"
+  iobroker:
+    image: 'buanet/iobroker:latest-v8'
+    container_name: iobroker
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./shared_container_volumes/iobroker:/opt/iobroker
+      - "/etc/timezone:/etc/timezone:ro"
+      - "/etc/localtime:/etc/localtime:ro"
+  essBATT_controller_service:
+    build: ./essBATT-Controller-
+    container_name: essBATT_controller_container
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./essBATT-Controller-:/code
+      - "/etc/timezone:/etc/timezone:ro"
+      - "/etc/localtime:/etc/localtime:ro"
+
