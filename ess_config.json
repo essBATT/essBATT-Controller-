@@ -12,9 +12,9 @@
     "script_alive_logging_interval": 86400,
     "ess_mode_2_settings":{
         "grid_power_setpoint_2700": 1,
-        "max_power_fed_to_loads_2704": 5000,
-        "max_battery_discharge_current": 33,
-        "max_battery_charge_current_2705": 33,
+        "max_power_fed_to_loads_2704": 300,
+        "max_battery_discharge_current": 5,
+        "max_battery_charge_current_2705": 5,
         "max_system_grid_feed_in_power_2706": 0,
         "feed_excess_dc_coupled_pv_into_grid_2707": 0,
         "feed_excess_ac_coupled_pv_into_grid_2708": 0
