@@ -20,9 +20,9 @@ services:
       - ./shared_container_volumes/iobroker:/opt/iobroker
       - "/etc/timezone:/etc/timezone:ro"
       - "/etc/localtime:/etc/localtime:ro"
-  essBATT_controller_service:
+  essbatt_controller_service:
     build: ./essBATT-Controller-
-    container_name: essBATT_controller_container
+    container_name: essbatt_controller_container
     network_mode: host
     restart: unless-stopped
     volumes:

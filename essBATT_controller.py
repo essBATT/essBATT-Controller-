@@ -438,7 +438,7 @@ class essBATT_controller:
                 # Only change if a change is necessary
                 if(self.ess_controller_state['winter_mode'] != 'activated'):
                     self.logger.info('Winter is coming! Go into winter mode!')
-                    self.ess_controller_state['winter_mode'] == 'activated'
+                    self.ess_controller_state['winter_mode'] = 'activated'
             elif((current_time_obj > final_start_obj) and (final_start_obj < final_end_obj)):
                 # Only change if a change is necessary
                 if(self.ess_controller_state['winter_mode'] != 'not_activated'):
@@ -1279,7 +1279,7 @@ class essBATT_controller:
     def read_config_json(self):
         try:
             if(DEBUGGING_ON):
-                f = open('./victron_ess_home_control/ess_config.json') # Path for debug mode
+                f = open('./smarthome_projects/essBATT-Controller-/ess_config.json') # Path for debug mode
             else:
                 f = open('ess_config.json') # Path for productive mode
         except:
@@ -1299,7 +1299,7 @@ class essBATT_controller:
     def read_setvalue_list_json(self):
         try:
             if(DEBUGGING_ON):
-                f = open('./victron_ess_home_control/ess_setvalue_list.json') # Path for debug mode
+                f = open('./smarthome_projects/essBATT-Controller-/ess_setvalue_list.json') # Path for debug mode
             else:
                 f = open('ess_setvalue_list.json') # Path for productive mode
         except:
@@ -1320,7 +1320,7 @@ class essBATT_controller:
         local_dict = {}
         try:
             if(DEBUGGING_ON):
-                f = open('./victron_ess_home_control/ess_controller_state') # Path for debug mode
+                f = open('./smarthome_projects/essBATT-Controller-/ess_controller_state') # Path for debug mode
             else:
                 f = open('./ess_controller_state') # Path for productive mode
         except:
@@ -1342,7 +1342,7 @@ class essBATT_controller:
         self.ess_controller_state_loaded_correctly = False
         try:
             if(DEBUGGING_ON):
-                f = open('./victron_ess_home_control/ess_controller_state', 'w', encoding='utf-8') # Path for debug mode
+                f = open('./smarthome_projects/essBATT-Controller-/ess_controller_state', 'w', encoding='utf-8') # Path for debug mode
             else:
                 f = open('./ess_controller_state', 'w', encoding='utf-8') # Path for productive mode
         except:
