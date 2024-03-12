@@ -272,7 +272,7 @@ class essBATT_controller:
             if(diff_time.total_seconds() > 300):
                 # if we have detected a steady "low SOC event" we want to switch off inverter and charger
                 highest_priority_switch_val = 4
-                self.logger.debug('Stable low SOC after debounce time detected!')
+                self.logger.info('Stable low SOC after debounce time detected!')
         
         # Now we check if we have a winter limitation
         if('winter_mode' in self.ess_controller_state and self.ess_controller_state['winter_mode'] == 'activated'):
@@ -429,6 +429,7 @@ class essBATT_controller:
                 if(self.ess_controller_state['winter_mode'] != 'not_activated'):
                     self.logger.info('Winter is gone. Go into summer mode!')
                     self.ess_controller_state['winter_mode'] = 'not_activated'
+                    self.reset_winter_mode_states()
             elif((current_time_obj > final_start_obj) and (current_time_obj < final_end_obj)):
                 # Only change if a change is necessary
                 if(self.ess_controller_state['winter_mode'] != 'activated'):
@@ -444,6 +445,7 @@ class essBATT_controller:
                 if(self.ess_controller_state['winter_mode'] != 'not_activated'):
                     self.logger.info('Winter is gone. Go into summer mode!')
                     self.ess_controller_state['winter_mode'] = 'not_activated'
+                    self.reset_winter_mode_states()
             else:         
                 self.logger.error('Should not occur. Another thing is wrong with the winter/summer decision.')
                 self.logger.error('current_time_obj: ' + str(current_time_obj) + ', final_start_obj: ' + str(final_start_obj) + ', final_end_obj: ' + str(final_end_obj))
@@ -463,7 +465,7 @@ class essBATT_controller:
             
             
             # Now check if charging due to low cell voltage in winter mode is required to protect the cells
-            if(self.temporary_script_states['winter_mode_multis_switch_off_time'] is not None and local_values['all_CCGX_values_available']):
+            if(self.temporary_script_states['winter_mode_multis_switch_off_time'] is not None and local_values['all_CCGX_values_available'] and self.ess_config_data['winter_mode']['winter_inactive_charge_min_voltage'] != "none"):
                 # if multis are already switched off due to winter mode for more than 10 Minutes (settling time hardcoded)
                 # and the min cell voltage is equal/below the configured threshold
                 diff_time_multis_switch_off_obj = current_time_obj - self.temporary_script_states['winter_mode_multis_switch_off_time']
@@ -480,21 +482,7 @@ class essBATT_controller:
                         self.temporary_script_states['winter_mode_inactive_charge_begin_time'] = None
                         self.do_state_update('normal_operation')
                         self.logger.info('"ENDING" charging due to "WINTER MODE INACTIVE CHARGE" time minutes passed. Number of minutes passed: ' + str(diff_time_charge_started_obj.total_seconds()/60))
-            
-            
-            # # TODO: Keep minimum voltage - Wie umsetzen????
-            # if(local_values['all_CCGX_values_available']):
-            #     if((self.temporary_script_states['winter_mode_charge_begin_time'] is None) and (local_values['battery_min_cell_voltage'] <= self.ess_config_data['winter_mode']['winter_inactive_charge_min_voltage'])):
-            #         self.temporary_script_states['winter_mode_charge_begin_time'] = current_time_obj
-            #         self.activate_charge_to_SOC_from_script(target_soc = 80, max_current = 20, current_direction='charge')
-            #         self.logger.info('"STARTING" charging due to "WINTER MODE KEEP MINIMUM VOLTAGE" reached. Minimum cell voltage: ' + str(local_values['battery_min_cell_voltage']))
-            #     if(self.temporary_script_states['winter_mode_charge_begin_time'] is not None):
-            #         diff_time = current_time_obj - self.temporary_script_states['winter_mode_charge_begin_time']
-            #         if(diff_time.total_seconds() > 600):
-            #             self.temporary_script_states['winter_mode_charge_begin_time'] = None
-            #             self.do_state_update('normal_operation')
-            #             self.logger.info('"ENDING" charging due to "WINTER MODE KEEP MINIMUM VOLTAGE" time minutes passed. Number of minutes passed: ' + str(diff_time.total_seconds()/60))
-                    
+               
         elif(self.ess_config_data['winter_mode']['use_winter_mode'] == 0):
             pass # do nothing - just checking wrong values
         else:
@@ -571,7 +559,11 @@ class essBATT_controller:
         self.ess_controller_state['charge_to_SOC']['requested_current_direction'] = current_direction
         self.do_state_update('charge_to_SOC')
         
-    
+    def reset_winter_mode_states(self):
+        self.temporary_script_states['winter_mode_multis_switch_off_time'] = None
+        self.temporary_script_states['winter_mode_inactive_charge_begin_time'] = None
+        self.temporary_script_states['winter_mode_charge_begin_time'] = None
+        
     def get_scheduled_starttime_datetime_obj(self, mode_string):
         format_string = self.ess_config_data['external_control_settings']['date_format'] + ' ' + self.ess_config_data['external_control_settings']['time_format']
         try:
@@ -1214,6 +1206,7 @@ class essBATT_controller:
         """
         Possible values for "switch_position": 1=Charger Only; 2=Inverter Only; 3=On; 4=Off
         See modbus tcp register list 3.10:
+        https://www.victronenergy.com/support-and-downloads/technical-information
         com.victronenergy.vebus	Switch Position	33	uint16	1	0 to 65536	/Mode	yes	1	See Venus-OS manual for limitations, for example when VE.Bus BMS or DMC is installed.
         """
         if('vebus' in self.CCGX_data):
