@@ -272,7 +272,7 @@ class essBATT_controller:
             if(diff_time.total_seconds() > 300):
                 # if we have detected a steady "low SOC event" we want to switch off inverter and charger
                 highest_priority_switch_val = 4
-                self.logger.info('Stable low SOC after debounce time detected!')
+                self.logger.debug('Stable low SOC after debounce time detected!')
         
         # Now we check if we have a winter limitation
         if('winter_mode' in self.ess_controller_state and self.ess_controller_state['winter_mode'] == 'activated'):
@@ -866,46 +866,54 @@ class essBATT_controller:
             # If the regular current limit is smaller than the max battery discharge current we start to hit the discharge limits which we want to control/filter 
             discharge_regular_limit_diff = local_values['discharge_current_limit_regular'] - self.temporary_script_states['discharge_current_limit_state']
             # if the current limit is smaller than the limit from the last cycle the difference will be negative --> we hit a new discharge current threshold
-            if(discharge_regular_limit_diff < 0):
+            # Second condition that needs to be true is that we are still discharging and not charging.
+            if((discharge_regular_limit_diff < -0.01) and ((local_values['battery_current'] < 0))):
                 self.temporary_script_states['discharge_current_limit_state'] = local_values['discharge_current_limit_regular']
-                self.logger.debug('Discharge current limit got stricter. Now is: ' + str(self.temporary_script_states['discharge_current_limit_state']))
+                self.logger.info('Discharge current limit got stricter. Now is: ' + str(self.temporary_script_states['discharge_current_limit_state']) + '. discharge_regular_limit_diff: ' + str(discharge_regular_limit_diff) + ', discharge_current_limit_regular: ' + str(local_values['discharge_current_limit_regular']) + ', discharge_current_limit_state: ' + str(self.temporary_script_states['discharge_current_limit_state']))
             # To have a better reset condition we need to store if we have hit the "zero current" limit
             if(local_values['discharge_current_limit_regular'] < 0.1):
                 self.temporary_script_states['discharge_current_limit_hit_zero'] = True
+                self.logger.info('discharge_current_limit_hit_zero is True now')
             # Now that we have the set condition for the 'discharge_current_limit_state' we now need the reset condition:
             # If the minimum cell voltage gets above the "min_cell_voltage_discharging_resume" from ess_config.json "the discharge limit fixing" done here will be reset
             if(   (local_values['battery_min_cell_voltage'] > self.ess_config_data['battery_settings']['min_cell_voltage_discharging_resume'] and self.temporary_script_states['discharge_current_limit_hit_zero'] is True)
                 or ((local_values['battery_current'] > DISCHARGE_LIMIT_RESET_CHARGE_CURRENT) and (self.temporary_script_states['discharge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current']))):
+                
+                if((local_values['battery_min_cell_voltage'] > self.ess_config_data['battery_settings']['min_cell_voltage_discharging_resume'] and self.temporary_script_states['discharge_current_limit_hit_zero'] is True) is True):
+                    self.logger.info('Condition that triggered the reset: Min cell voltage above discharge resume voltage and discharge current limit had hit zero before.')
+                if(((local_values['battery_current'] > DISCHARGE_LIMIT_RESET_CHARGE_CURRENT) and (self.temporary_script_states['discharge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current'])) is True):
+                    self.logger.info('Condition that triggered the reset: Battery current above "reset charge current" (internal script parameter) and the stored discharge limit was not yet reset. ' + 'battery_current: ' + str(local_values['battery_current']) + ' discharge_current_limit_state: ' + str(self.temporary_script_states['discharge_current_limit_state']))
+                
                 self.temporary_script_states['discharge_current_limit_state'] = self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current']
                 self.temporary_script_states['discharge_current_limit_hit_zero'] = False
                 self.logger.info('Discharge current limit reset to default value! Now: ' + str(self.temporary_script_states['discharge_current_limit_state']))
-                if((local_values['battery_min_cell_voltage'] > self.ess_config_data['battery_settings']['min_cell_voltage_discharging_resume'] and self.temporary_script_states['discharge_current_limit_hit_zero'] is True)):
-                    self.logger.info('Condition that triggered the reset: Min cell voltage above discharge resume voltage and discharge current limit had hit zero before.')
-                if((local_values['battery_min_cell_voltage'] > self.ess_config_data['battery_settings']['min_cell_voltage_discharging_resume'] and self.temporary_script_states['discharge_current_limit_hit_zero'] is True)):
-                    self.logger.info('Condition that triggered the reset: Battery current above "reset charge current" (internal script parameter) and the stored discharge limit was not yet reset.')
+                
             # New limit for charging
             # If the regular current limit is smaller than the max battery discharge current we start to hit the discharge limits which we want to control/filter 
             charge_regular_limit_diff = local_values['charge_current_limit_regular'] - self.temporary_script_states['charge_current_limit_state']
             # if the current limit is smaller than the limit from the last cycle the difference will be negative --> we hit a new charge current threshold
-            if(charge_regular_limit_diff < 0):
+            if((charge_regular_limit_diff < -0.01) and (local_values['battery_current'] > 0)):
                 self.temporary_script_states['charge_current_limit_state'] = local_values['charge_current_limit_regular']
-                self.logger.debug('Charge current limit got stricter. Now is: ' + str(self.temporary_script_states['charge_current_limit_state']))
+                self.logger.info('Charge current limit got stricter. Now is: ' + str(self.temporary_script_states['charge_current_limit_state'])  + '. discharge_regular_limit_diff: ' + str(charge_regular_limit_diff) + ', charge_current_limit_regular: ' + str(local_values['charge_current_limit_regular']) + ', charge_current_limit_state: ' + str(self.temporary_script_states['charge_current_limit_state']))
             # To have a better reset condition we need to store if we have hit the "zero current" limit
             if(local_values['charge_current_limit_regular'] < 0.1):
                 self.temporary_script_states['charge_current_limit_hit_zero'] = True
+                self.logger.info('charge_current_limit_hit_zero is True now')
             # Now that we have the set condition for the 'charge_current_limit_state' we now need the reset condition:
             # If the maximum cell voltage gets below the "max_cell_voltage_charging_resume" from ess_config.json and previously has hit the charge limit 0 
             # OR we have a strong discharge signal "the charge limit fixing" done here will be reset
             if(   (local_values['battery_max_cell_voltage'] <= self.ess_config_data['battery_settings']['max_cell_voltage_charging_resume'] and self.temporary_script_states['charge_current_limit_hit_zero'] is True)
                 or ((local_values['battery_current'] < CHARGE_LIMIT_RESET_DISCHARGE_CURRENT) and (self.temporary_script_states['charge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']))):
-                self.temporary_script_states['charge_current_limit_state'] = self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']
-                self.temporary_script_states['charge_current_limit_hit_zero'] = False
-                self.logger.info('Charge current limit reset to default value! Now: ' + str(self.temporary_script_states['charge_current_limit_state']))
+                
                 if((local_values['battery_max_cell_voltage'] <= self.ess_config_data['battery_settings']['max_cell_voltage_charging_resume'] and self.temporary_script_states['charge_current_limit_hit_zero'] is True)):
                     self.logger.info('Condition that triggered the reset: Max cell voltage below charge resume voltage and charge current limit had hit zero before.')
                 if(((local_values['battery_current'] < CHARGE_LIMIT_RESET_DISCHARGE_CURRENT) and (self.temporary_script_states['charge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']))):
                     self.logger.info('Condition that triggered the reset: Battery current above "reset discharge current" (internal script parameter) and the stored charge limit was not yet reset.')
-        
+                
+                self.temporary_script_states['charge_current_limit_state'] = self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']
+                self.temporary_script_states['charge_current_limit_hit_zero'] = False
+                self.logger.info('Charge current limit reset to default value! Now: ' + str(self.temporary_script_states['charge_current_limit_state']))
+
         ###### Now bring all limits together and aggregate the final limits ##########################################################
         
         # Append all valid charge current limits
