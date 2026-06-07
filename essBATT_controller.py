@@ -84,7 +84,6 @@ class essBATT_controller:
         self.mqtt_client = None
         self.mqtt_connection_ok = False
         self.mqtt_disconnected = True
-        self.rt_keep_alive_obj = RepeatedTimer(CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
         self.ess_internal_state = {}
         self.ess_config_data = {}
         self.ess_setvalue_list = {}
@@ -95,11 +94,18 @@ class essBATT_controller:
         self.ess_controller_state_loaded_correctly = False
         self.CCGX_data = {'grid':{},'battery':{}, 'solarcharger':{}, 'settings':{}, 'system':{}}
         self.read_config_json()
+        if not self.ess_config_data_loaded_correctly:
+            return
         self.read_setvalue_list_json()
+        if not self.ess_setvalue_list_loaded_correctly:
+            return
         self.ess_controller_state = self.read_ess_controller_state_json()
+        if not self.ess_controller_state_loaded_correctly:
+            return
         self.write_base_path = 'W/'+ self.ess_config_data['vrm_id'] + '/'
         self.logger.setLevel(LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data['debug_level']])
         self.logger.info('Effective logger level: ' + str(self.logger.getEffectiveLevel()))
+        self.rt_keep_alive_obj = RepeatedTimer(CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
         self.rt_ess_control_update_obj = RepeatedTimer(self.ess_config_data['control_update_rate'], self.ess_control_cycle_update)
         self.rt_print_status_obj = RepeatedTimer(self.ess_config_data['script_alive_logging_interval'], self.print_alive_status_to_logger)
         self.temporary_script_states = self.create_temporary_script_states_dict()
@@ -246,7 +252,7 @@ class essBATT_controller:
             # If no charger limitation exists just switch off the inverter
             if(highest_priority_switch_val == 3):
                 highest_priority_switch_val = 1
-                self.logger.debug('DEACTIVATE inverter because of charge limit final being below solarcharger power sum + 20%: ' + str((local_values['solarcharger_power_sum'] * 1.2)))
+                self.logger.debug('DEACTIVATE inverter because discharge power limit is below solarcharger power sum + 20%: ' + str((local_values['solarcharger_power_sum'] * 1.2)))
             # if we already have a charger limitation and now additionally an inverter limitation switch off both
             elif(highest_priority_switch_val == 2):
                 highest_priority_switch_val = 4
@@ -329,7 +335,7 @@ class essBATT_controller:
                 self.logger.debug('Checked external input: Neither "balancing" nor "charge_to_SOC" external command received yet. No state changes required.')
             # If at least one command was received
             if(latest_external_input_timestamp_obj is not None):
-                if(self.ess_external_input['new_data_received'] is True):
+                if(self.ess_external_input.get('new_data_received') is True):
                     self.copy_external_data_to_internal_state_dict(target_state, local_values)
             #### Now check state changes due to scheduled events from external starttimes  #####################################################
             current_time_obj = datetime.now(tz=None)
@@ -411,6 +417,7 @@ class essBATT_controller:
                 winter_mode_end_next_year_obj   = datetime.strptime(self.ess_config_data['winter_mode']['winter_mode_end_date'] + next_year_str, '%d.%m.%Y')
             except:
                 self.logger.error('Error in ess_config.json file regarding winter mode start or end dates. Probably wrong format. Use e.g. 12.03. for twelve march.')
+                return
             final_start_obj = winter_mode_start_this_year_obj
             # if winter end is after winter start the order is ok and nothing needs to be adapted
             if(winter_mode_end_this_year_obj > winter_mode_start_this_year_obj):
@@ -610,6 +617,9 @@ class essBATT_controller:
                 self.reset_single_state_data('balancing')
                 # First evaluate if the goal is to discharge or to charge
                 if('target_SOC' in self.ess_external_input['charge_to_SOC']):
+                    if('battery_soc' not in local_values):
+                        self.logger.warning('charge_to_SOC command ignored: battery SOC not available yet.')
+                        return
                     if(self.ess_external_input['charge_to_SOC']['target_SOC'] > local_values['battery_soc']):
                         self.ess_controller_state['charge_to_SOC']['requested_current_direction'] = 'charge'
                     elif(self.ess_external_input['charge_to_SOC']['target_SOC'] == local_values['battery_soc']):
@@ -805,7 +815,7 @@ class essBATT_controller:
         # Case discharge limit violation
         if((local_values['battery_current'] < 0.0) and (abs(local_values['battery_current']) > local_values['discharge_current_limit_regular'])):
             local_values['violation_current'] = abs(local_values['battery_current']) - local_values['discharge_current_limit_regular']
-            local_values['charge_current_limit_violation'] = True
+            local_values['discharge_current_limit_violation'] = True
         # Case charge limit violation
         elif((local_values['battery_current'] > 0.0) and (abs(local_values['battery_current']) > local_values['charge_current_limit_regular'])):
             local_values['violation_current'] = abs(local_values['battery_current']) - local_values['charge_current_limit_regular']
@@ -1224,7 +1234,8 @@ class essBATT_controller:
                 current_instance_id = str(key)
                 counter = counter + 1
             # If the switch has a different position than the set value switch it to the new value
-            if(self.CCGX_data['vebus'][current_instance_id]['Mode'] != switch_position):
+            current_mode = self.CCGX_data['vebus'][current_instance_id].get('Mode')
+            if current_mode is None or current_mode != switch_position:
                 topic_str = self.write_base_path + 'vebus/' + current_instance_id + '/Mode'
                 payload_str = json.dumps({"value": switch_position})
                 self.mqtt_client.publish(topic=topic_str, payload=payload_str, qos=1, retain=0)
@@ -1241,6 +1252,8 @@ class essBATT_controller:
         # https://github.com/victronenergy/dbus-mqtt
         # https://www.victronenergy.com/live/ess:ess_mode_2_and_3
         try:
+            if self.mqtt_client is None or not self.mqtt_connection_ok:
+                return
             # Sends keepalive to Victron OS in a way, that all available topics are returned (good for debugging but high network and system load)
             if(self.ess_config_data['keepalive_get_all_topics'] == 1):
                 payload_string = ""
@@ -1276,7 +1289,7 @@ class essBATT_controller:
                 errcode = self.mqtt_client.publish(topic_string, payload)
                 self.logger.debug("Keepalive (selected topics) message send! Errorcode: " + str(errcode) + ". Published topic: \'" + topic_string + '. Payload: ' + payload)
             else:
-                self.logger.warning(log_string)
+                self.logger.warning('Invalid keepalive_get_all_topics value: ' + str(self.ess_config_data['keepalive_get_all_topics']))
         except:
             # Logging
             log_string = "FAILED to publish Keep Alive message to Cerbo!"
@@ -1334,14 +1347,16 @@ class essBATT_controller:
                 f = open('./ess_controller_state') # Path for productive mode
         except:
             self.logger.error("ess_controller_state file could not be opened!")
-            return
+            self.ess_controller_state_loaded_correctly = False
+            return local_dict
         # returns JSON object as a dictionary
         try:           
             local_dict = json.load(f)
         except:
             self.logger.error("ess_controller_state was opened but could not be loaded. Check for json file syntax errors!")
             f.close()
-            return
+            self.ess_controller_state_loaded_correctly = False
+            return local_dict
         self.ess_controller_state_loaded_correctly = True
         self.logger.debug('ess_controller_state.json file loaded.')
         f.close()
@@ -1790,20 +1805,22 @@ if __name__ == "__main__":
     ess_controller_obj = essBATT_controller(app_log)
 
     ######### Start the application ############################
-    if(ess_controller_obj.ess_config_data_loaded_correctly is True):
+    if(ess_controller_obj.ess_config_data_loaded_correctly is True
+       and ess_controller_obj.ess_setvalue_list_loaded_correctly is True
+       and ess_controller_obj.ess_controller_state_loaded_correctly is True):
         try:
             ess_controller_obj.run()
         finally:
             ess_controller_obj.logger.warning("essBATT controller: Shutdown. Control loop exited and needs restart.")
-            # Timer Objects have to be stopped
-            ess_controller_obj.rt_keep_alive_obj.stop()
-            ess_controller_obj.rt_ess_control_update_obj.stop()
-            ess_controller_obj.rt_print_status_obj.stop()
-            # MQTT Loop needs to be stopped
-            ess_controller_obj.mqtt_client.loop_stop()
+            for timer_attr in ('rt_keep_alive_obj', 'rt_ess_control_update_obj', 'rt_print_status_obj'):
+                timer = getattr(ess_controller_obj, timer_attr, None)
+                if timer is not None:
+                    timer.stop()
+            if ess_controller_obj.mqtt_client is not None:
+                ess_controller_obj.mqtt_client.loop_stop()
     else:
         ess_controller_obj.logger.warning("essBATT controller not running and needs restart!")
-        # Timer Object has to be stopped
-        ess_controller_obj.rt_keep_alive_obj.stop()
-        ess_controller_obj.rt_ess_control_update_obj.stop()
-        ess_controller_obj.rt_print_status_obj.stop()
+        for timer_attr in ('rt_keep_alive_obj', 'rt_ess_control_update_obj', 'rt_print_status_obj'):
+            timer = getattr(ess_controller_obj, timer_attr, None)
+            if timer is not None:
+                timer.stop()
