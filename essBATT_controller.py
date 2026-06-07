@@ -160,9 +160,15 @@ class essBATT_controller:
                 # This is the loop for the ess control cycle update functionality (ess_control_cycle_update()). It is empty because this function is
                 # called with the help of the "repeated timer" in a periodical manner (see _init_ function)
                 pass
-        except:
-            self.logger.error('Could not establish connection to MQTT Server. Critical error.')
-            self.mqtt_client.loop_stop()
+        except OSError as e:
+            self.logger.error('MQTT connection failed (network/OS): ' + str(e))
+            if self.mqtt_client is not None:
+                self.mqtt_client.loop_stop()
+            self.mqtt_connection_ok = False
+        except Exception:
+            self.logger.exception('Unexpected error during MQTT setup')
+            if self.mqtt_client is not None:
+                self.mqtt_client.loop_stop()
             self.mqtt_connection_ok = False
                 
     def ess_control_cycle_update(self):
@@ -395,14 +401,14 @@ class essBATT_controller:
                             if((nof_diff_days >= target_diff_days) and (current_time_obj.strftime('%A') == target_weekday_str) and target_time_passed):
                                 self.logger.info('Autobalancing condition met!')
                                 self.do_state_update('balancing') 
-                        except:
-                            self.logger.error('Should not occur because value only set internally with no user interaction! time of last balancing in ess_controller_state file has wrong format. See strftime documentation for correct time syntax (%d-%b-%Y (%H:%M:%S.%f)).')
+                        except ValueError as e:
+                            self.logger.error('time_of_last_completed_balancing has wrong format (%d-%b-%Y (%H:%M:%S.%f)): ' + str(e))
                     else:
                         if((current_time_obj.strftime('%A') == target_weekday_str) and target_time_passed):
                             self.logger.info('First activation autobalancing condition met!')
                             self.do_state_update('balancing') 
-                except:
-                    self.logger.error('Auto balancing timeinformation (weekday, time or both) are not set correctly. See strftime documentation for correct time syntax (%A,%H:%M).')
+                except ValueError as e:
+                    self.logger.error('Auto balancing weekday/time invalid (expected %%A,%%H:%M): ' + str(e))
         # WINTER MODE #
         if(self.ess_config_data['winter_mode']['use_winter_mode'] == 1):
             # First need to test some hypotheses to find the correct year for winter mode start and end date
@@ -415,8 +421,8 @@ class essBATT_controller:
                 winter_mode_start_this_year_obj = datetime.strptime(self.ess_config_data['winter_mode']['winter_mode_start_date'] + current_time_year_str, '%d.%m.%Y')
                 winter_mode_end_this_year_obj   = datetime.strptime(self.ess_config_data['winter_mode']['winter_mode_end_date'] + current_time_year_str, '%d.%m.%Y')
                 winter_mode_end_next_year_obj   = datetime.strptime(self.ess_config_data['winter_mode']['winter_mode_end_date'] + next_year_str, '%d.%m.%Y')
-            except:
-                self.logger.error('Error in ess_config.json file regarding winter mode start or end dates. Probably wrong format. Use e.g. 12.03. for twelve march.')
+            except ValueError as e:
+                self.logger.error('Winter mode start/end dates invalid in ess_config.json (use e.g. 12.03.): ' + str(e))
                 return
             final_start_obj = winter_mode_start_this_year_obj
             # if winter end is after winter start the order is ok and nothing needs to be adapted
@@ -575,7 +581,7 @@ class essBATT_controller:
         format_string = self.ess_config_data['external_control_settings']['date_format'] + ' ' + self.ess_config_data['external_control_settings']['time_format']
         try:
             ret_val = datetime.strptime(self.ess_controller_state[mode_string]['scheduled_start_time'], format_string)
-        except:
+        except ValueError:
             ret_val = None
         return ret_val
        
@@ -740,8 +746,8 @@ class essBATT_controller:
         try:
             temp_obj = datetime.strptime(combined_datetime_str, format_string)
             return temp_obj
-        except:
-            self.logger.error('Datetime Object could not be created. Input String: ' + combined_datetime_str)
+        except ValueError as e:
+            self.logger.error('Datetime object could not be created from "' + combined_datetime_str + '": ' + str(e))
             return -1
     
             
@@ -941,11 +947,11 @@ class essBATT_controller:
         if('charge_current_limit_state' in self.temporary_script_states):
             charge_current_limits_list.append(self.temporary_script_states['charge_current_limit_state'])
             info_str = info_str + 'charge_current_limit_state'
-        try:
+        if charge_current_limits_list:
             local_values['charge_current_limit_final'] = min(charge_current_limits_list)
             self.logger.debug('charge_current_limit_final: ' + str(local_values['charge_current_limit_final']) + ' from list: ' + ','.join(map(str, charge_current_limits_list)) + ' (' + info_str + ').')
-        except:
-            self.logger.error('Determination of charge current limits failed!')
+        else:
+            self.logger.error('Determination of charge current limits failed: no limits in list')
         # Append all valid discharge current limits
         discharge_current_limits_list = []
         info_str = ''
@@ -957,10 +963,10 @@ class essBATT_controller:
             discharge_current_limits_list.append(local_values['winter_discharge_limit'])
         if('discharge_current_limit_state' in self.temporary_script_states):
             discharge_current_limits_list.append(self.temporary_script_states['discharge_current_limit_state'])
-        try:
+        if discharge_current_limits_list:
             local_values['discharge_current_limit_final'] = min(discharge_current_limits_list)
-        except:
-            self.logger.error('Determination of discharge current limits failed!')
+        else:
+            self.logger.error('Determination of discharge current limits failed: no limits in list')
         # Append all valid discharge power limits
         discharge_power_limits_list = []
         if('discharge_power_limit_regular' in local_values):
@@ -982,11 +988,11 @@ class essBATT_controller:
             discharge_power_limit_regular_state = self.calc_discharge_power_limit_from_current(local_values, self.temporary_script_states['discharge_current_limit_state'])
             discharge_power_limits_list.append(discharge_power_limit_regular_state)
             info_str = info_str + 'discharge_current_limit_state'
-        try:
+        if discharge_power_limits_list:
             local_values['discharge_power_limit_final'] = int(min(discharge_power_limits_list))
             self.logger.debug('discharge_power_limit_final: ' + str(local_values['discharge_power_limit_final']) + ' from list: ' + ','.join(map(str, discharge_power_limits_list)) + '(' + info_str + ').')
-        except:
-            self.logger.error('Determination of discharge power limits failed!')
+        else:
+            self.logger.error('Determination of discharge power limits failed: no limits in list')
             
         # Store values from this cycle as information for next cycle
         self.temporary_script_states['discharge_regular_current_limit_last_cycle'] = local_values['discharge_current_limit_regular']
@@ -1116,8 +1122,8 @@ class essBATT_controller:
                             self.logger.debug('Charge current limit Max Cell Only (' + self.ess_config_data['battery_settings']['charge_limit_mode'] + ') with current_charge_limit ' + str(current_charge_limit))
                     else:
                         self.logger.error('Charge limit mode not unknown in ess_config.json. You entered value: ' + self.ess_config_data['battery_settings']['charge_limit_mode'])
-                except:
-                    self.logger.error('Error in soc_based_charge_limit or max_cell_based_charge_limit config in ess_config.json. 1. Limits need to be in ascending order 2. the two corresponding arrays need to have the same number of elements.')
+                except (IndexError, TypeError, KeyError) as e:
+                    self.logger.error('Invalid charge limit arrays in ess_config.json (ascending order, equal length): ' + str(e))
                     return current_charge_limit  
                 # The last step is to take the configured maximum charge limit into account
                 if(soc_or_max_cell_limit_set is True):
@@ -1181,8 +1187,8 @@ class essBATT_controller:
                             self.logger.debug('Discharge current limit Min Cell only. (' + self.ess_config_data['battery_settings']['discharge_limit_mode'] + ') with current_discharge_limit ' + str(current_discharge_limit))
                     else:
                         self.logger.error('Discharge limit mode not unknown in ess_config.json. You entered value: ' + self.ess_config_data['battery_settings']['discharge_limit_mode'])
-                except:
-                    self.logger.error('Error in soc_based_discharge_limit or min_cell_based_discharge_limit config in ess_config.json. 1. Limits need to be in descending order 2. the two corresponding arrays need to have the same number of elements.')
+                except (IndexError, TypeError, KeyError) as e:
+                    self.logger.error('Invalid discharge limit arrays in ess_config.json (descending order, equal length): ' + str(e))
                     return current_discharge_limit  
                 # The last step is to take the configured maximum charge limit into account
                 if(soc_or_min_cell_limit_set is True):
@@ -1212,8 +1218,8 @@ class essBATT_controller:
                         self.mqtt_client.publish(topic=topic_str, payload=payload_str, qos=1, retain=0)
                         self.logger.debug(set_val_name_str + ': Published ' + payload_str + ' on ' + topic_str + '. self.CCGX_data["settings"]["' + set_val_name_str + '"]: ' + str(self.CCGX_data['settings'][set_val_name_str]))
                         retval = 1
-                    except:
-                        self.logger.error(set_val_name_str + 'setpoint sending failed!')
+                    except (TypeError, ValueError, KeyError) as e:
+                        self.logger.error(set_val_name_str + ' setpoint sending failed: ' + str(e))
                         retval = -1
         else: 
             self.logger.error('No set value name given!')
@@ -1290,98 +1296,83 @@ class essBATT_controller:
                 self.logger.debug("Keepalive (selected topics) message send! Errorcode: " + str(errcode) + ". Published topic: \'" + topic_string + '. Payload: ' + payload)
             else:
                 self.logger.warning('Invalid keepalive_get_all_topics value: ' + str(self.ess_config_data['keepalive_get_all_topics']))
-        except:
-            # Logging
-            log_string = "FAILED to publish Keep Alive message to Cerbo!"
-            self.logger.warning(log_string)
+        except (KeyError, TypeError, ValueError) as e:
+            self.logger.warning('Failed to publish keepalive message to Cerbo: ' + str(e))
+        except Exception:
+            self.logger.exception('Unexpected error while publishing keepalive to Cerbo')
             
     def print_alive_status_to_logger(self):
         self.logger.info('ESS Controller script is up and running!')
+
+    def _config_file_path(self, debug_relative_path, prod_relative_path):
+        if(DEBUGGING_ON):
+            return debug_relative_path
+        return prod_relative_path
+
+    def _read_json_file(self, debug_relative_path, prod_relative_path, file_description):
+        config_path = self._config_file_path(debug_relative_path, prod_relative_path)
+        try:
+            with open(config_path, encoding='utf-8') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            self.logger.error(file_description + ' not found at: ' + config_path)
+        except json.JSONDecodeError as e:
+            self.logger.error(file_description + ' contains invalid JSON: ' + str(e))
+        except OSError as e:
+            self.logger.error('Could not read ' + file_description + ': ' + str(e))
+        return None
     
     def read_config_json(self):
-        try:
-            if(DEBUGGING_ON):
-                f = open('./smarthome_projects/essBATT-Controller-/ess_config.json') # Path for debug mode
-            else:
-                f = open('ess_config.json') # Path for productive mode
-        except:
-            self.logger.error("ess_config.json file could not be opened!")
+        data = self._read_json_file(
+            './smarthome_projects/essBATT-Controller-/ess_config.json',
+            'ess_config.json',
+            'ess_config.json')
+        if data is None:
             return
-        # returns JSON object as a dictionary
-        try:           
-            self.ess_config_data = json.load(f)
-        except:
-            self.logger.error("ess_config.json was opened but could not be loaded. Check for json file syntax errors!")
-            f.close()
-            return
+        self.ess_config_data = data
         self.ess_config_data_loaded_correctly = True
         self.logger.debug('ess_config.json file loaded.')
-        f.close()
         
     def read_setvalue_list_json(self):
-        try:
-            if(DEBUGGING_ON):
-                f = open('./smarthome_projects/essBATT-Controller-/ess_setvalue_list.json') # Path for debug mode
-            else:
-                f = open('ess_setvalue_list.json') # Path for productive mode
-        except:
-            self.logger.error("ess_setvalue_list.json file could not be opened!")
+        data = self._read_json_file(
+            './smarthome_projects/essBATT-Controller-/ess_setvalue_list.json',
+            'ess_setvalue_list.json',
+            'ess_setvalue_list.json')
+        if data is None:
             return
-        # returns JSON object as a dictionary
-        try:           
-            self.ess_setvalue_list = json.load(f)
-        except:
-            self.logger.error("ess_setvalue_list.json was opened but could not be loaded. Check for json file syntax errors!")
-            f.close()
-            return
+        self.ess_setvalue_list = data
         self.ess_setvalue_list_loaded_correctly = True
         self.logger.debug('ess_setvalue_list.json file loaded.')
-        f.close()
         
     def read_ess_controller_state_json(self):
         local_dict = {}
-        try:
-            if(DEBUGGING_ON):
-                f = open('./smarthome_projects/essBATT-Controller-/ess_controller_state') # Path for debug mode
-            else:
-                f = open('./ess_controller_state') # Path for productive mode
-        except:
-            self.logger.error("ess_controller_state file could not be opened!")
-            self.ess_controller_state_loaded_correctly = False
-            return local_dict
-        # returns JSON object as a dictionary
-        try:           
-            local_dict = json.load(f)
-        except:
-            self.logger.error("ess_controller_state was opened but could not be loaded. Check for json file syntax errors!")
-            f.close()
+        data = self._read_json_file(
+            './smarthome_projects/essBATT-Controller-/ess_controller_state',
+            './ess_controller_state',
+            'ess_controller_state')
+        if data is None:
             self.ess_controller_state_loaded_correctly = False
             return local_dict
         self.ess_controller_state_loaded_correctly = True
-        self.logger.debug('ess_controller_state.json file loaded.')
-        f.close()
-        return local_dict
+        self.logger.debug('ess_controller_state file loaded.')
+        return data
         
     def store_ess_controller_state_in_file(self):
         self.ess_controller_state_loaded_correctly = False
+        state_path = self._config_file_path(
+            './smarthome_projects/essBATT-Controller-/ess_controller_state',
+            './ess_controller_state')
         try:
-            if(DEBUGGING_ON):
-                f = open('./smarthome_projects/essBATT-Controller-/ess_controller_state', 'w', encoding='utf-8') # Path for debug mode
-            else:
-                f = open('./ess_controller_state', 'w', encoding='utf-8') # Path for productive mode
-        except:
-            self.logger.error("ess_controller_state file could not be opened!")
+            with open(state_path, 'w', encoding='utf-8') as f:
+                json.dump(self.ess_controller_state, f, ensure_ascii=False, indent=4)
+        except OSError as e:
+            self.logger.error('ess_controller_state could not be written: ' + str(e))
             return
-        # returns JSON object as a dictionary
-        try:           
-            json.dump(self.ess_controller_state, f, ensure_ascii=False, indent=4)
-        except:
-            self.logger.error("ess_controller_state was opened but could not be stored. Check for json file syntax errors!")
-            f.close()
+        except TypeError as e:
+            self.logger.error('ess_controller_state contains non-serializable data: ' + str(e))
             return
         self.ess_controller_state_loaded_correctly = True
-        self.logger.debug('ess_controller_state.json file loaded.')
-        f.close()
+        self.logger.debug('ess_controller_state file stored.')
     
     def add_topic_specific_callbacks(self, base_path_str):
         # Grid
@@ -1442,6 +1433,18 @@ class essBATT_controller:
         topic_str = base_path_str + "/vebus/+/Mode"
         self.mqtt_client.message_callback_add(topic_str, self.on_msg_multis_switch_mode)
         
+    def _parse_victron_mqtt_value(self, msg):
+        """Parse Victron dbus-mqtt JSON payload for settings/system/vebus topics (no device-removed handling)."""
+        try:
+            payload = json.loads(msg.payload)
+        except json.JSONDecodeError:
+            self.logger.warning('Invalid JSON on MQTT topic ' + msg.topic + ': ' + str(msg.payload))
+            return None
+        if 'value' not in payload:
+            self.logger.warning('MQTT message without "value" on topic ' + msg.topic)
+            return None
+        return payload['value']
+
     def device_removed_from_bus_detected(self, topic):
         split_topic = topic.split('/')
         device_type = split_topic[2]
@@ -1453,8 +1456,8 @@ class essBATT_controller:
             else:
                 self.CCGX_data[device_type][device_instance] = {}
             self.logger.info('Received json string without "value". Probably device removed from bus. Topic: ' + topic)
-        except:
-            self.logger.error('Deleting device instance due to empty payload failed for unknown reason.') 
+        except KeyError as e:
+            self.logger.error('Deleting device instance due to empty payload failed: ' + str(e))
         
                          
     ##################### MQTT Callback Functions ##############
@@ -1486,87 +1489,86 @@ class essBATT_controller:
     def on_msg_grid_power(self, client, userdata, msg):
         try:
             self.CCGX_data['grid']['grid_power_sum'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_L1_power(self, client, userdata, msg):
         try:
-            
             self.CCGX_data['grid']['L1_power'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_L1_current(self, client, userdata, msg):
         try:
             self.CCGX_data['grid']['L1_current'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_L2_power(self, client, userdata, msg):
         try:
             self.CCGX_data['grid']['L2_power'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_L2_current(self, client, userdata, msg):
         try:
             self.CCGX_data['grid']['L2_current'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_L3_power(self, client, userdata, msg):
         try:
             self.CCGX_data['grid']['L3_power'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_L3_current(self, client, userdata, msg):
-        try:    
+        try:
             self.CCGX_data['grid']['L3_current'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     # Battery
     def on_msg_battery_soc(self, client, userdata, msg):
         try:
             self.CCGX_data['battery']['soc'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_battery_maxcellvoltage(self, client, userdata, msg):
         try:
             self.CCGX_data['battery']['max_cell_voltage'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_battery_mincellvoltage(self, client, userdata, msg):
         try:
             self.CCGX_data['battery']['min_cell_voltage'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_battery_temp(self, client, userdata, msg):
         try:
             self.CCGX_data['battery']['temperature'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_battery_current(self, client, userdata, msg):
         try:
             self.CCGX_data['battery']['current'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_battery_power(self, client, userdata, msg):
         try:
             self.CCGX_data['battery']['power'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
             
     def on_msg_battery_voltage(self, client, userdata, msg):
         try:
             self.CCGX_data['battery']['voltage'] = json.loads(msg.payload)['value']
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
     # Solarcharger
     # With "grid" and "battery" callbacks the callback functions only handle one value. With the solarchargers the message handling is 
@@ -1584,7 +1586,7 @@ class essBATT_controller:
                 self.CCGX_data['solarcharger'][solar_charger_topic_id_str] = {}
             # Store the power value
             self.CCGX_data['solarcharger'][solar_charger_topic_id_str]['Power'] = payload_value
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
        
     def on_msg_solarcharger_dc_values(self, client, userdata, msg):
@@ -1598,68 +1600,76 @@ class essBATT_controller:
                 self.CCGX_data['solarcharger'][solar_charger_topic_id_str] = {}
             # Store the value in the corresponding data field
             self.CCGX_data['solarcharger'][solar_charger_topic_id_str][value_name_str] = payload_value
-        except:
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
             self.device_removed_from_bus_detected(msg.topic)
     
     # System
     def on_msg_system_AC_consumption(self, client, userdata, msg):
         split_topic = msg.topic.split('/')
-        phase_number = split_topic[6]
-        if(phase_number != 'NumberOfPhases'):
+        try:
+            phase_number = split_topic[6]
             measurement_name = split_topic[7]
-            value_name = phase_number + '_loads_power_consumption'
-            try:
-                if(measurement_name == 'Power'):
-                    payload_value = json.loads(msg.payload)['value']
-                    self.CCGX_data['system'][value_name] = payload_value
-            except:
-                self.logger.error('Unexpected payload received. Should not happen.')
+        except IndexError:
+            self.logger.error('Malformed system consumption topic: ' + msg.topic)
+            return
+        if(phase_number != 'NumberOfPhases' and measurement_name == 'Power'):
+            payload_value = self._parse_victron_mqtt_value(msg, treat_missing_value_as_device_removed=False)
+            if payload_value is not None:
+                value_name = phase_number + '_loads_power_consumption'
+                self.CCGX_data['system'][value_name] = payload_value
             
     # Misc
     def on_msg_settings_Cgwacs(self, client, userdata, msg):
         split_topic = msg.topic.split('/')
-        value_name = split_topic[6]
         try:
-            payload_value = json.loads(msg.payload)['value']
-            self.CCGX_data['settings'][value_name] = payload_value
-            # Store required path to the settings for write requests
-            if('settings_base_path' not in self.CCGX_data):
-                self.CCGX_data['settings_base_path'] = 'settings/' + split_topic[3] + '/Settings/'
-        except:
-            self.logger.error('Unexpected payload received. Should not happen with settings.')
+            value_name = split_topic[6]
+            settings_instance = split_topic[3]
+        except IndexError:
+            self.logger.error('Malformed settings CGwacs topic: ' + msg.topic)
+            return
+        payload_value = self._parse_victron_mqtt_value(msg, treat_missing_value_as_device_removed=False)
+        if payload_value is None:
+            return
+        self.CCGX_data['settings'][value_name] = payload_value
+        if('settings_base_path' not in self.CCGX_data):
+            self.CCGX_data['settings_base_path'] = 'settings/' + settings_instance + '/Settings/'
         
     def on_msg_settings_SystemSetup(self, client, userdata, msg):
         split_topic = msg.topic.split('/')
-        value_name = split_topic[6]
         try:
-            payload_value = json.loads(msg.payload)['value']
+            value_name = split_topic[6]
+        except IndexError:
+            self.logger.error('Malformed settings SystemSetup topic: ' + msg.topic)
+            return
+        payload_value = self._parse_victron_mqtt_value(msg, treat_missing_value_as_device_removed=False)
+        if payload_value is not None:
             self.CCGX_data['settings'][value_name] = payload_value
-        except:
-            self.logger.error('Unexpected payload received. Should not happen with settings.')
             
     def on_msg_multis_switch_mode(self, client, userdata, msg):
         split_topic = msg.topic.split('/')
-        instance_id = split_topic[3]
-        value_name = split_topic[4]
         try:
-            if('vebus' not in self.CCGX_data):
-                self.CCGX_data['vebus'] = {}
-            if(instance_id not in self.CCGX_data['vebus']):
-                self.CCGX_data['vebus'][instance_id] = {}
-            payload_value = json.loads(msg.payload)['value']
-            self.CCGX_data['vebus'][instance_id][value_name] = payload_value
-        except:
-            self.logger.error('Unexpected payload received. Should not happen with vebus.')
+            instance_id = split_topic[3]
+            value_name = split_topic[4]
+        except IndexError:
+            self.logger.error('Malformed vebus topic: ' + msg.topic)
+            return
+        payload_value = self._parse_victron_mqtt_value(msg, treat_missing_value_as_device_removed=False)
+        if payload_value is None:
+            return
+        if('vebus' not in self.CCGX_data):
+            self.CCGX_data['vebus'] = {}
+        if(instance_id not in self.CCGX_data['vebus']):
+            self.CCGX_data['vebus'][instance_id] = {}
+        self.CCGX_data['vebus'][instance_id][value_name] = payload_value
 
     # External
     def on_msg_ext_charge_to_SOC(self, client, userdata, msg):
+        current_limit_used = False
+        starttime_used = False
+        startdate_used = False
         try:
             payload = msg.payload.decode('utf-8')
             split_payload = payload.split('/')
-            current_limit_used = False
-            starttime_used = False
-            startdate_used = False
-
             activated = split_payload[0]
             target_soc = int(split_payload[1])
             if(split_payload[2] != '-'):
@@ -1671,33 +1681,32 @@ class essBATT_controller:
             if(split_payload[4] != '-'):
                 date_input = split_payload[4]
                 startdate_used = True
-        except:
-            self.logger.error('Payload could not be decoded.')
+        except UnicodeDecodeError:
+            self.logger.error('charge_to_SOC payload is not valid UTF-8')
             return
-        try:
-            if('charge_to_SOC' not in self.ess_external_input):
-                self.ess_external_input['charge_to_SOC'] = {}
-            self.ess_external_input['charge_to_SOC']['target_SOC'] = target_soc
-            self.ess_external_input['charge_to_SOC']['activated'] = activated
-            if(current_limit_used):
-                self.ess_external_input['charge_to_SOC']['current_limit_input'] = current_limit
-            if(starttime_used):
-                self.ess_external_input['charge_to_SOC']['time_input'] = time_input
-            if(startdate_used):
-                self.ess_external_input['charge_to_SOC']['date_input'] = date_input
-            self.ess_external_input['charge_to_SOC']['receive_time'] = datetime.now(tz=None)
-            self.ess_external_input['new_data_received'] = True
-        except:
-            self.logger.error('Should not occur. Function failed.')
+        except (IndexError, ValueError) as e:
+            self.logger.error('charge_to_SOC payload format invalid (expected activated/target_soc/current/time/date): ' + str(e))
+            return
+        if('charge_to_SOC' not in self.ess_external_input):
+            self.ess_external_input['charge_to_SOC'] = {}
+        self.ess_external_input['charge_to_SOC']['target_SOC'] = target_soc
+        self.ess_external_input['charge_to_SOC']['activated'] = activated
+        if(current_limit_used):
+            self.ess_external_input['charge_to_SOC']['current_limit_input'] = current_limit
+        if(starttime_used):
+            self.ess_external_input['charge_to_SOC']['time_input'] = time_input
+        if(startdate_used):
+            self.ess_external_input['charge_to_SOC']['date_input'] = date_input
+        self.ess_external_input['charge_to_SOC']['receive_time'] = datetime.now(tz=None)
+        self.ess_external_input['new_data_received'] = True
             
     def on_msg_ext_balancing(self, client, userdata, msg):
+        current_limit_used = False
+        starttime_used = False
+        startdate_used = False
         try:
             payload = msg.payload.decode('utf-8')
             split_payload = payload.split('/')
-            current_limit_used = False
-            starttime_used = False
-            startdate_used = False
-            
             activated = split_payload[0]
             if(split_payload[1] != '-'):
                 current_limit = int(split_payload[1])
@@ -1708,83 +1717,83 @@ class essBATT_controller:
             if(split_payload[3] != '-'):
                 date_input = split_payload[3]
                 startdate_used = True
-        except:
-            self.logger.error('Payload could not be decoded.')
+        except UnicodeDecodeError:
+            self.logger.error('balancing payload is not valid UTF-8')
             return
-        try:
-            if('balancing' not in self.ess_external_input):
-                self.ess_external_input['balancing'] = {}
-            self.ess_external_input['balancing']['activated'] = activated
-            if(current_limit_used):
-                self.ess_external_input['balancing']['current_limit_input'] = current_limit
-            if(starttime_used):
-                self.ess_external_input['balancing']['time_input'] = time_input
-            if(startdate_used):
-                self.ess_external_input['balancing']['date_input'] = date_input
-            self.ess_external_input['balancing']['receive_time'] = datetime.now(tz=None)
-            self.ess_external_input['new_data_received'] = True
-        except:
-            self.logger.error('Should not occur. Function failed.')
+        except (IndexError, ValueError) as e:
+            self.logger.error('balancing payload format invalid (expected activated/current/time/date): ' + str(e))
+            return
+        if('balancing' not in self.ess_external_input):
+            self.ess_external_input['balancing'] = {}
+        self.ess_external_input['balancing']['activated'] = activated
+        if(current_limit_used):
+            self.ess_external_input['balancing']['current_limit_input'] = current_limit
+        if(starttime_used):
+            self.ess_external_input['balancing']['time_input'] = time_input
+        if(startdate_used):
+            self.ess_external_input['balancing']['date_input'] = date_input
+        self.ess_external_input['balancing']['receive_time'] = datetime.now(tz=None)
+        self.ess_external_input['new_data_received'] = True
     
     def on_msg_ext_deactivate_discharge(self, client, userdata, msg):
         try:
             payload = msg.payload.decode('utf-8')
-            if((payload == 'False') or (payload == 'false')):
-                activation_state = False
-            elif((payload == 'True') or (payload == 'true')):
-                activation_state = True
-            else:
-                self.logger.error('Unknown payload: ' + payload)
-                return
-            if('deactivate_discharge' not in self.ess_external_input):
-                self.ess_external_input['deactivate_discharge'] = {}
-            self.ess_external_input['deactivate_discharge']['activated'] = activation_state
-            self.ess_external_input['deactivate_discharge']['receive_time'] = datetime.now(tz=None)
-            if(activation_state):
-                self.logger.info('"DISCHARGING" is now "DEACTIVATED"!')
-            else:
-                self.logger.info('"DISCHARGING" is now "ALLOWED"!')
-        except:
-            self.logger.error('Payload could not be decoded.')
+        except UnicodeDecodeError:
+            self.logger.error('deactivate_discharge payload is not valid UTF-8')
             return
+        if((payload == 'False') or (payload == 'false')):
+            activation_state = False
+        elif((payload == 'True') or (payload == 'true')):
+            activation_state = True
+        else:
+            self.logger.error('Unknown deactivate_discharge payload: ' + payload)
+            return
+        if('deactivate_discharge' not in self.ess_external_input):
+            self.ess_external_input['deactivate_discharge'] = {}
+        self.ess_external_input['deactivate_discharge']['activated'] = activation_state
+        self.ess_external_input['deactivate_discharge']['receive_time'] = datetime.now(tz=None)
+        if(activation_state):
+            self.logger.info('"DISCHARGING" is now "DEACTIVATED"!')
+        else:
+            self.logger.info('"DISCHARGING" is now "ALLOWED"!')
         
     def on_msg_ext_deactivate_charge(self, client, userdata, msg):
         try:
             payload = msg.payload.decode('utf-8')
-            if((payload == 'False') or (payload == 'false')):
-                activation_state = False
-            elif((payload == 'True') or (payload == 'true')):
-                activation_state = True
-            else:
-                self.logger.error('Unknown payload: ' + payload)
-                return
-            if('deactivate_charge' not in self.ess_external_input):
-                self.ess_external_input['deactivate_charge'] = {}
-            self.ess_external_input['deactivate_charge']['activated'] = activation_state
-            self.ess_external_input['deactivate_charge']['receive_time'] = datetime.now(tz=None)
-            if(activation_state):
-                self.logger.info('"CHARGING" is now "DEACTIVATED"!')
-            else:
-                self.logger.info('"CHARGING" is now "ALLOWED"!')
-        except:
-            self.logger.error('Payload could not be decoded.')
+        except UnicodeDecodeError:
+            self.logger.error('deactivate_charge payload is not valid UTF-8')
             return
+        if((payload == 'False') or (payload == 'false')):
+            activation_state = False
+        elif((payload == 'True') or (payload == 'true')):
+            activation_state = True
+        else:
+            self.logger.error('Unknown deactivate_charge payload: ' + payload)
+            return
+        if('deactivate_charge' not in self.ess_external_input):
+            self.ess_external_input['deactivate_charge'] = {}
+        self.ess_external_input['deactivate_charge']['activated'] = activation_state
+        self.ess_external_input['deactivate_charge']['receive_time'] = datetime.now(tz=None)
+        if(activation_state):
+            self.logger.info('"CHARGING" is now "DEACTIVATED"!')
+        else:
+            self.logger.info('"CHARGING" is now "ALLOWED"!')
         
     def on_msg_ext_reboot_ess_controller(self, client, userdata, msg):
         try:
             payload = msg.payload.decode('utf-8')
-            if((payload == 'False') or (payload == 'false')):
-                reboot = False
-            elif((payload == 'True') or (payload == 'true')):
-                reboot = True
-            else:
-                self.logger.error('Unknown payload: ' + payload)
-                return
-            if(reboot is True):
-                self.reboot_ess_controller_script()
-        except:
-            self.logger.error('Payload could not be decoded.')
+        except UnicodeDecodeError:
+            self.logger.error('reboot payload is not valid UTF-8')
             return
+        if((payload == 'False') or (payload == 'false')):
+            reboot = False
+        elif((payload == 'True') or (payload == 'true')):
+            reboot = True
+        else:
+            self.logger.error('Unknown reboot payload: ' + payload)
+            return
+        if(reboot is True):
+            self.reboot_ess_controller_script()
 
     ###############################################################
             
