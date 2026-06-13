@@ -23,6 +23,7 @@
 
 # For more information, please refer to <http://unlicense.org/>
 
+import copy
 import paho.mqtt.client as mqtt
 import logging
 from logging.handlers import RotatingFileHandler
@@ -65,8 +66,12 @@ class RepeatedTimer(object):
 
   def start(self):
     if not self.is_running:
+      now = time.time()
+      if self.next_call < now:
+        self.next_call = now
       self.next_call += self.interval
-      self._timer = threading.Timer(self.next_call - time.time(), self._run)
+      delay = max(0.01, self.next_call - time.time())
+      self._timer = threading.Timer(delay, self._run)
       self._timer.start()
       self.is_running = True
 
@@ -102,6 +107,7 @@ class essBATT_controller:
         self.ess_controller_state = self.read_ess_controller_state_json()
         if not self.ess_controller_state_loaded_correctly:
             return
+        self._ess_controller_state_snapshot = copy.deepcopy(self.ess_controller_state)
         self.write_base_path = 'W/'+ self.ess_config_data['vrm_id'] + '/'
         self.logger.setLevel(LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data['debug_level']])
         self.logger.info('Effective logger level: ' + str(self.logger.getEffectiveLevel()))
@@ -155,11 +161,10 @@ class essBATT_controller:
             # Send a keepalive directly after connected to MQTT server
             self.send_keepalive_to_cerbo()
             
-            ###### MAIN LOOP - ESS Control Loop while the MQTT connection is active ##########################
+            ###### MAIN LOOP - keep process alive while timers and MQTT run in background threads ##########################
             while self.mqtt_connection_ok is True:
-                # This is the loop for the ess control cycle update functionality (ess_control_cycle_update()). It is empty because this function is
-                # called with the help of the "repeated timer" in a periodical manner (see _init_ function)
-                pass
+                # ess_control_cycle_update() runs via RepeatedTimer; avoid busy-wait (pass would use ~100% CPU)
+                time.sleep(1)
         except OSError as e:
             self.logger.error('MQTT connection failed (network/OS): ' + str(e))
             if self.mqtt_client is not None:
@@ -311,11 +316,10 @@ class essBATT_controller:
         self.set_multis_switch_mode(switch_position=highest_priority_switch_val)
      
     def cleanup_after_control_loop(self):
-        controller_state_from_file = self.read_ess_controller_state_json()
-        # if the dict from the file is not equal to the saved file, save it.
-        # Rational: Reading the file often does not degrade the SD card as much as writing. So writing is limited to one time per control cycle if a change occured.
-        if(controller_state_from_file != self.ess_controller_state):
+        # Compare in-memory state only; avoids reading ess_controller_state from disk every control cycle
+        if(self.ess_controller_state != self._ess_controller_state_snapshot):
             self.store_ess_controller_state_in_file()
+            self._ess_controller_state_snapshot = copy.deepcopy(self.ess_controller_state)
             self.logger.debug('Change in the controller state dict detected! Storing dict to file ess_controller_state!')
             
     def statemachine_update(self, local_values):
@@ -1613,7 +1617,7 @@ class essBATT_controller:
             self.logger.error('Malformed system consumption topic: ' + msg.topic)
             return
         if(phase_number != 'NumberOfPhases' and measurement_name == 'Power'):
-            payload_value = self._parse_victron_mqtt_value(msg, treat_missing_value_as_device_removed=False)
+            payload_value = self._parse_victron_mqtt_value(msg)
             if payload_value is not None:
                 value_name = phase_number + '_loads_power_consumption'
                 self.CCGX_data['system'][value_name] = payload_value
@@ -1627,7 +1631,7 @@ class essBATT_controller:
         except IndexError:
             self.logger.error('Malformed settings CGwacs topic: ' + msg.topic)
             return
-        payload_value = self._parse_victron_mqtt_value(msg, treat_missing_value_as_device_removed=False)
+        payload_value = self._parse_victron_mqtt_value(msg)
         if payload_value is None:
             return
         self.CCGX_data['settings'][value_name] = payload_value
@@ -1641,7 +1645,7 @@ class essBATT_controller:
         except IndexError:
             self.logger.error('Malformed settings SystemSetup topic: ' + msg.topic)
             return
-        payload_value = self._parse_victron_mqtt_value(msg, treat_missing_value_as_device_removed=False)
+        payload_value = self._parse_victron_mqtt_value(msg)
         if payload_value is not None:
             self.CCGX_data['settings'][value_name] = payload_value
             
@@ -1653,7 +1657,7 @@ class essBATT_controller:
         except IndexError:
             self.logger.error('Malformed vebus topic: ' + msg.topic)
             return
-        payload_value = self._parse_victron_mqtt_value(msg, treat_missing_value_as_device_removed=False)
+        payload_value = self._parse_victron_mqtt_value(msg)
         if payload_value is None:
             return
         if('vebus' not in self.CCGX_data):
