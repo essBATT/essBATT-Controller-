@@ -33,53 +33,9 @@ import threading
 from datetime import datetime, timedelta
 import numbers
 
-
-DEBUGGING_ON = False # Switch for debugging
-
-###### Script internal parameters ########################################
-CHARGE_LIMIT_RESET_DISCHARGE_CURRENT = -4.0
-DISCHARGE_LIMIT_RESET_CHARGE_CURRENT = 4.0
-CERBO_KEEPALIVE_LENGTH = (30.0) # [s] Alle CERBO_KEEPALIVE_LENGTH Sekunden wird eine Keepalive Nachricht an den Cerbo gesendet
-MQTT_SERVER_TIMEOUT_TIMESPAN = 60 # [s] After this timeout timespan with no from the MQTT server some error handling will be triggered
-##########################################################################
-
-LOGLEVEL_NAME_TO_NUMBER = {'CRITICAL': 50, 'FATAL': 50, 'ERROR': 40, 'WARNING': 30, 'WARN': 30, 'INFO': 20, 'DEBUG': 10, 'NOTSET': 0}
-MULTIS_SWITCH_NUMBER_STRING_MAPPING = {'1':"CHARGER ON INVERTER OFF", '2':"INVERTER ON CHARGER OFF", '3':"INVERTER AND CHARGER ON", '4':"INVERTER AND CHARGER OFF"}
-
-################### Timer Class ##############################
-# Class from MestreLion: https://stackoverflow.com/questions/474528/how-to-repeatedly-execute-a-function-every-x-seconds
-class RepeatedTimer(object):
-  def __init__(self, interval, function, *args, **kwargs):
-    self._timer = None
-    self.interval = interval
-    self.function = function
-    self.args = args
-    self.kwargs = kwargs
-    self.is_running = False
-    self.next_call = time.time()
-    self.start()
-
-  def _run(self):
-    self.is_running = False
-    self.start()
-    self.function(*self.args, **self.kwargs)
-
-  def start(self):
-    if not self.is_running:
-      now = time.time()
-      if self.next_call < now:
-        self.next_call = now
-      self.next_call += self.interval
-      delay = max(0.01, self.next_call - time.time())
-      self._timer = threading.Timer(delay, self._run)
-      self._timer.start()
-      self.is_running = True
-
-  def stop(self):
-    self._timer.cancel()
-    self.is_running = False
-###############################################################
-
+# New modular imports (Step 1 of modularization)
+import constants
+from utils import RepeatedTimer
 
 
 ##################### essBATT Controller Class ##############
@@ -109,9 +65,9 @@ class essBATT_controller:
             return
         self._ess_controller_state_snapshot = copy.deepcopy(self.ess_controller_state)
         self.write_base_path = 'W/'+ self.ess_config_data['vrm_id'] + '/'
-        self.logger.setLevel(LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data['debug_level']])
+        self.logger.setLevel(constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data['debug_level']])
         self.logger.info('Effective logger level: ' + str(self.logger.getEffectiveLevel()))
-        self.rt_keep_alive_obj = RepeatedTimer(CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
+        self.rt_keep_alive_obj = RepeatedTimer(constants.CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
         self.rt_ess_control_update_obj = RepeatedTimer(self.ess_config_data['control_update_rate'], self.ess_control_cycle_update)
         self.rt_print_status_obj = RepeatedTimer(self.ess_config_data['script_alive_logging_interval'], self.print_alive_status_to_logger)
         self.temporary_script_states = self.create_temporary_script_states_dict()
@@ -144,8 +100,8 @@ class essBATT_controller:
         self.mqtt_client.on_disconnect = self.on_disconnect
                 
         try:
-            self.mqtt_client.connect('localhost', port=self.ess_config_data['mqtt_server_COM_port'], keepalive=MQTT_SERVER_TIMEOUT_TIMESPAN, bind_address="")
-            self.logger.info("essBATT controller: Try to connect to MQTT Server: localhost on port " + str(self.ess_config_data['mqtt_server_COM_port']) + " with timeout of " + str(MQTT_SERVER_TIMEOUT_TIMESPAN) + "s")
+            self.mqtt_client.connect('localhost', port=self.ess_config_data['mqtt_server_COM_port'], keepalive=constants.MQTT_SERVER_TIMEOUT_TIMESPAN, bind_address="")
+            self.logger.info("essBATT controller: Try to connect to MQTT Server: localhost on port " + str(self.ess_config_data['mqtt_server_COM_port']) + " with timeout of " + str(constants.MQTT_SERVER_TIMEOUT_TIMESPAN) + "s")
             self.mqtt_client.loop_start()
             while not self.mqtt_connection_ok: #wait in loop until connected by on_connect callback function
                 self.logger.info("Waiting for MQTT server connection...")
@@ -183,7 +139,7 @@ class essBATT_controller:
             if(self.ess_config_data['check_ess_config_changes_while_running'] == 1):
                 self.read_config_json()
                 # Some additional settings that otherwise would not change due to online changes (changes while script is running) in ess_config_json.
-                self.logger.setLevel(LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data['debug_level']])
+                self.logger.setLevel(constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data['debug_level']])
                 self.rt_ess_control_update_obj.interval = self.ess_config_data['control_update_rate']
 
             ############# Read data from Victron System ###################################
@@ -897,11 +853,11 @@ class essBATT_controller:
             # Now that we have the set condition for the 'discharge_current_limit_state' we now need the reset condition:
             # If the minimum cell voltage gets above the "min_cell_voltage_discharging_resume" from ess_config.json "the discharge limit fixing" done here will be reset
             if(   (local_values['battery_min_cell_voltage'] > self.ess_config_data['battery_settings']['min_cell_voltage_discharging_resume'] and self.temporary_script_states['discharge_current_limit_hit_zero'] is True)
-                or ((local_values['battery_current'] > DISCHARGE_LIMIT_RESET_CHARGE_CURRENT) and (self.temporary_script_states['discharge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current']))):
+                or ((local_values['battery_current'] > constants.DISCHARGE_LIMIT_RESET_CHARGE_CURRENT) and (self.temporary_script_states['discharge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current']))):
                 
                 if((local_values['battery_min_cell_voltage'] > self.ess_config_data['battery_settings']['min_cell_voltage_discharging_resume'] and self.temporary_script_states['discharge_current_limit_hit_zero'] is True) is True):
                     self.logger.info('Condition that triggered the reset: Min cell voltage above discharge resume voltage and discharge current limit had hit zero before.')
-                if(((local_values['battery_current'] > DISCHARGE_LIMIT_RESET_CHARGE_CURRENT) and (self.temporary_script_states['discharge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current'])) is True):
+                if(((local_values['battery_current'] > constants.DISCHARGE_LIMIT_RESET_CHARGE_CURRENT) and (self.temporary_script_states['discharge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current'])) is True):
                     self.logger.info('Condition that triggered the reset: Battery current above "reset charge current" (internal script parameter) and the stored discharge limit was not yet reset. ' + 'battery_current: ' + str(local_values['battery_current']) + ' discharge_current_limit_state: ' + str(self.temporary_script_states['discharge_current_limit_state']))
                 
                 self.temporary_script_states['discharge_current_limit_state'] = self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current']
@@ -923,11 +879,11 @@ class essBATT_controller:
             # If the maximum cell voltage gets below the "max_cell_voltage_charging_resume" from ess_config.json and previously has hit the charge limit 0 
             # OR we have a strong discharge signal "the charge limit fixing" done here will be reset
             if(   (local_values['battery_max_cell_voltage'] <= self.ess_config_data['battery_settings']['max_cell_voltage_charging_resume'] and self.temporary_script_states['charge_current_limit_hit_zero'] is True)
-                or ((local_values['battery_current'] < CHARGE_LIMIT_RESET_DISCHARGE_CURRENT) and (self.temporary_script_states['charge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']))):
+                or ((local_values['battery_current'] < constants.CHARGE_LIMIT_RESET_DISCHARGE_CURRENT) and (self.temporary_script_states['charge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']))):
                 
                 if((local_values['battery_max_cell_voltage'] <= self.ess_config_data['battery_settings']['max_cell_voltage_charging_resume'] and self.temporary_script_states['charge_current_limit_hit_zero'] is True)):
                     self.logger.info('Condition that triggered the reset: Max cell voltage below charge resume voltage and charge current limit had hit zero before.')
-                if(((local_values['battery_current'] < CHARGE_LIMIT_RESET_DISCHARGE_CURRENT) and (self.temporary_script_states['charge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']))):
+                if(((local_values['battery_current'] < constants.CHARGE_LIMIT_RESET_DISCHARGE_CURRENT) and (self.temporary_script_states['charge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']))):
                     self.logger.info('Condition that triggered the reset: Battery current above "reset discharge current" (internal script parameter) and the stored charge limit was not yet reset.')
                 
                 self.temporary_script_states['charge_current_limit_state'] = self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']
@@ -1249,7 +1205,7 @@ class essBATT_controller:
                 topic_str = self.write_base_path + 'vebus/' + current_instance_id + '/Mode'
                 payload_str = json.dumps({"value": switch_position})
                 self.mqtt_client.publish(topic=topic_str, payload=payload_str, qos=1, retain=0)
-                self.logger.info('"Multis SWITCH" switched to ' + MULTIS_SWITCH_NUMBER_STRING_MAPPING[str(switch_position)] + '(value: ' + str(switch_position) + ')')
+                self.logger.info('"Multis SWITCH" switched to ' + constants.MULTIS_SWITCH_NUMBER_STRING_MAPPING[str(switch_position)] + '(value: ' + str(switch_position) + ')')
             if(counter > 1):
                 self.logger.error('It seems that there is more than one instance of "vebus" available. This was not considered during development of the script and needs to be investigated!!!')
 
@@ -1309,7 +1265,7 @@ class essBATT_controller:
         self.logger.info('ESS Controller script is up and running!')
 
     def _config_file_path(self, debug_relative_path, prod_relative_path):
-        if(DEBUGGING_ON):
+        if(constants.DEBUGGING_ON):
             return debug_relative_path
         return prod_relative_path
 
