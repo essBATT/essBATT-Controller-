@@ -33,9 +33,10 @@ import threading
 from datetime import datetime, timedelta
 import numbers
 
-# New modular imports (Step 1 of modularization)
+# New modular imports (Step 1 + Step 2 of modularization)
 import constants
 from utils import RepeatedTimer
+from config_manager import ConfigManager
 
 
 ##################### essBATT Controller Class ##############
@@ -54,39 +55,43 @@ class essBATT_controller:
         self.ess_setvalue_list_loaded_correctly = False
         self.ess_controller_state_loaded_correctly = False
         self.CCGX_data = {'grid':{},'battery':{}, 'solarcharger':{}, 'settings':{}, 'system':{}}
-        self.read_config_json()
+
+        # Step 2: Use ConfigManager for all config/state handling
+        self.config_manager = ConfigManager(self.logger, debug=constants.DEBUGGING_ON)
+
+        self.ess_config_data = self.config_manager.load_config()
+        self.ess_config_data_loaded_correctly = self.config_manager.config_data_loaded_correctly
         if not self.ess_config_data_loaded_correctly:
             return
-        self.read_setvalue_list_json()
+
+        self.ess_setvalue_list = self.config_manager.load_setvalue_list()
+        self.ess_setvalue_list_loaded_correctly = self.config_manager.setvalue_list_loaded_correctly
         if not self.ess_setvalue_list_loaded_correctly:
             return
-        self.ess_controller_state = self.read_ess_controller_state_json()
+
+        self.ess_controller_state = self.config_manager.load_state()
+        self.ess_controller_state_loaded_correctly = self.config_manager.controller_state_loaded_correctly
         if not self.ess_controller_state_loaded_correctly:
-            return
+            self.ess_controller_state = {}  # fallback
+
         self._ess_controller_state_snapshot = copy.deepcopy(self.ess_controller_state)
-        self.write_base_path = 'W/'+ self.ess_config_data['vrm_id'] + '/'
-        self.logger.setLevel(constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data['debug_level']])
+        self.write_base_path = 'W/' + self.ess_config_data.get('vrm_id', 'unknown') + '/'
+
+        self.logger.setLevel(constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data.get('debug_level', 'INFO')])
         self.logger.info('Effective logger level: ' + str(self.logger.getEffectiveLevel()))
+
         self.rt_keep_alive_obj = RepeatedTimer(constants.CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
-        self.rt_ess_control_update_obj = RepeatedTimer(self.ess_config_data['control_update_rate'], self.ess_control_cycle_update)
-        self.rt_print_status_obj = RepeatedTimer(self.ess_config_data['script_alive_logging_interval'], self.print_alive_status_to_logger)
-        self.temporary_script_states = self.create_temporary_script_states_dict()
+        self.rt_ess_control_update_obj = RepeatedTimer(
+            self.ess_config_data.get('control_update_rate', 2.0), self.ess_control_cycle_update
+        )
+        self.rt_print_status_obj = RepeatedTimer(
+            self.ess_config_data.get('script_alive_logging_interval', 86400),
+            self.print_alive_status_to_logger
+        )
+        self.temporary_script_states = self.config_manager.create_temporary_script_states(self.ess_config_data)
     
-    # Not all states off the script need to be stored in "ess_controller_state" file, because it is not really relevant if the state is lost due to script restart etc.
-    # All less relevant states shall be stored in this dict.    
-    def create_temporary_script_states_dict(self):
-        ret_dict = {
-            "multi_switch_min_soc_debounce_time": None,
-            "winter_mode_multis_switch_off_time": None,
-            "winter_mode_inactive_charge_begin_time": None,
-            "emergency_(dis)charge_begin_time": None,
-            "winter_mode_charge_begin_time": None,
-            "discharge_current_limit_state": self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current'],
-            "discharge_current_limit_hit_zero": False,
-            "charge_current_limit_state": self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705'],
-            "charge_current_limit_hit_zero": False
-        }
-        return ret_dict
+    # Note: create_temporary_script_states_dict() has been moved to ConfigManager.
+    # The call now happens through self.config_manager.create_temporary_script_states(...)
 ###############################################################################################################################################################################################################################
 ###############################################################################################################################################################################################################################
 ###############################################################################################################################################################################################################################       
@@ -273,10 +278,11 @@ class essBATT_controller:
      
     def cleanup_after_control_loop(self):
         # Compare in-memory state only; avoids reading ess_controller_state from disk every control cycle
-        if(self.ess_controller_state != self._ess_controller_state_snapshot):
-            self.store_ess_controller_state_in_file()
+        if self.ess_controller_state != self._ess_controller_state_snapshot:
+            self.config_manager.save_state_if_changed(
+                self.ess_controller_state, self._ess_controller_state_snapshot
+            )
             self._ess_controller_state_snapshot = copy.deepcopy(self.ess_controller_state)
-            self.logger.debug('Change in the controller state dict detected! Storing dict to file ess_controller_state!')
             
     def statemachine_update(self, local_values):
         #### First check the external input ############################################################
@@ -1264,75 +1270,8 @@ class essBATT_controller:
     def print_alive_status_to_logger(self):
         self.logger.info('ESS Controller script is up and running!')
 
-    def _config_file_path(self, debug_relative_path, prod_relative_path):
-        if(constants.DEBUGGING_ON):
-            return debug_relative_path
-        return prod_relative_path
-
-    def _read_json_file(self, debug_relative_path, prod_relative_path, file_description):
-        config_path = self._config_file_path(debug_relative_path, prod_relative_path)
-        try:
-            with open(config_path, encoding='utf-8') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            self.logger.error(file_description + ' not found at: ' + config_path)
-        except json.JSONDecodeError as e:
-            self.logger.error(file_description + ' contains invalid JSON: ' + str(e))
-        except OSError as e:
-            self.logger.error('Could not read ' + file_description + ': ' + str(e))
-        return None
-    
-    def read_config_json(self):
-        data = self._read_json_file(
-            './smarthome_projects/essBATT-Controller-/ess_config.json',
-            'ess_config.json',
-            'ess_config.json')
-        if data is None:
-            return
-        self.ess_config_data = data
-        self.ess_config_data_loaded_correctly = True
-        self.logger.debug('ess_config.json file loaded.')
-        
-    def read_setvalue_list_json(self):
-        data = self._read_json_file(
-            './smarthome_projects/essBATT-Controller-/ess_setvalue_list.json',
-            'ess_setvalue_list.json',
-            'ess_setvalue_list.json')
-        if data is None:
-            return
-        self.ess_setvalue_list = data
-        self.ess_setvalue_list_loaded_correctly = True
-        self.logger.debug('ess_setvalue_list.json file loaded.')
-        
-    def read_ess_controller_state_json(self):
-        local_dict = {}
-        data = self._read_json_file(
-            './smarthome_projects/essBATT-Controller-/ess_controller_state',
-            './ess_controller_state',
-            'ess_controller_state')
-        if data is None:
-            self.ess_controller_state_loaded_correctly = False
-            return local_dict
-        self.ess_controller_state_loaded_correctly = True
-        self.logger.debug('ess_controller_state file loaded.')
-        return data
-        
-    def store_ess_controller_state_in_file(self):
-        self.ess_controller_state_loaded_correctly = False
-        state_path = self._config_file_path(
-            './smarthome_projects/essBATT-Controller-/ess_controller_state',
-            './ess_controller_state')
-        try:
-            with open(state_path, 'w', encoding='utf-8') as f:
-                json.dump(self.ess_controller_state, f, ensure_ascii=False, indent=4)
-        except OSError as e:
-            self.logger.error('ess_controller_state could not be written: ' + str(e))
-            return
-        except TypeError as e:
-            self.logger.error('ess_controller_state contains non-serializable data: ' + str(e))
-            return
-        self.ess_controller_state_loaded_correctly = True
-        self.logger.debug('ess_controller_state file stored.')
+    # All config and state related methods have been moved to ConfigManager (Step 2).
+    # See config_manager.py for load_config(), load_state(), save_state_if_changed(), etc.
     
     def add_topic_specific_callbacks(self, base_path_str):
         # Grid
