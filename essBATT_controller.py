@@ -778,18 +778,77 @@ class essBATT_controller:
         else:
             self.logger.error('Unknown "current state". Check ess_controller_state file.')
         pass
-    
-    # All battery limit calculation methods (calculate_dis_charge_limits, get_charge_..., get_discharge_..., calc_discharge_power_limit...) 
-    # have been moved to BatteryProtector (Step 3). The controller now calls self.battery_protector.calculate_dis_charge_limits(local_values)
-        # Store values from this cycle as information for next cycle
-        self.temporary_script_states['discharge_regular_current_limit_last_cycle'] = local_values['discharge_current_limit_regular']
 
-    def calc_discharge_power_limit_from_current(self, local_values, input_current):
-        # Max output power Multi = (Maximum power the battery is allowed to deliver      ) + (Current solar input power) 
-        return                     ((abs(input_current * local_values['battery_voltage'])) + local_values['solarcharger_power_sum'])
-    
-    # read_values_to_local_dict() remains in controller for now (will be refactored in later step).
-    # All battery limit methods (get_charge_..., get_discharge_..., calculate_dis_charge_limits) have been moved to BatteryProtector (Step 3).
+    # read_values_to_local_dict() remains in controller for now (will be refactored in later step - it prepares data from MQTT for the state machine and protector).
+    def read_values_to_local_dict(self, local_values):
+        local_values['all_CCGX_values_available'] = True
+        if('grid_power_sum' in self.CCGX_data['grid']):
+            local_values['grid_power_sum'] = self.CCGX_data['grid']['grid_power_sum']
+        else:
+            local_values['all_CCGX_values_available'] = False
+        if('soc' in self.CCGX_data['battery']):
+            local_values['battery_soc'] = self.CCGX_data['battery']['soc']
+        else:
+            local_values['all_CCGX_values_available'] = False
+        if('max_cell_voltage' in self.CCGX_data['battery']):
+            local_values['battery_max_cell_voltage'] = self.CCGX_data['battery']['max_cell_voltage']
+        else:
+            local_values['all_CCGX_values_available'] = False
+        if('min_cell_voltage' in self.CCGX_data['battery']):
+            local_values['battery_min_cell_voltage'] = self.CCGX_data['battery']['min_cell_voltage']
+        else:
+            local_values['all_CCGX_values_available'] = False
+        if('current' in self.CCGX_data['battery']):
+            local_values['battery_current'] = self.CCGX_data['battery']['current']
+        else:
+            local_values['all_CCGX_values_available'] = False
+        if('power' in self.CCGX_data['battery']):
+            local_values['battery_power'] = self.CCGX_data['battery']['power']
+        else:
+            local_values['all_CCGX_values_available'] = False
+        if('voltage' in self.CCGX_data['battery']):
+            local_values['battery_voltage'] = self.CCGX_data['battery']['voltage']
+        else:
+            local_values['all_CCGX_values_available'] = False
+        if('L1_loads_power_consumption' in self.CCGX_data['system']):
+            local_values['l1_loads_power_consumtpion'] = self.CCGX_data['system']['L1_loads_power_consumption']
+        else:
+            local_values['all_CCGX_values_available'] = False
+        if('L2_loads_power_consumption' in self.CCGX_data['system']):
+            local_values['l2_loads_power_consumtpion'] = self.CCGX_data['system']['L2_loads_power_consumption']
+        else:
+            local_values['all_CCGX_values_available'] = False
+        if('L3_loads_power_consumption' in self.CCGX_data['system']):
+            local_values['l3_loads_power_consumtpion'] = self.CCGX_data['system']['L3_loads_power_consumption']
+        else:
+            local_values['all_CCGX_values_available'] = False
+                
+        local_values['solarcharger_power_sum'] = 0    
+        for element in self.CCGX_data['solarcharger']:
+            if('Power' in self.CCGX_data['solarcharger'][element]):
+                local_values['solarcharger_power_sum'] = local_values['solarcharger_power_sum'] + self.CCGX_data['solarcharger'][element]['Power']
+            else:
+                local_values['all_CCGX_values_available'] = False
+        local_values['solarcharger_current_sum'] = 0    
+        for element in self.CCGX_data['solarcharger']:
+            if('Current' in self.CCGX_data['solarcharger'][element]):
+                local_values['solarcharger_current_sum'] = local_values['solarcharger_current_sum'] + self.CCGX_data['solarcharger'][element]['Current']
+            else:
+                local_values['all_CCGX_values_available'] = False
+        
+        if(local_values['all_CCGX_values_available']):        
+            # Total loads power consumption
+            local_values['loads_total_power'] = local_values['l1_loads_power_consumtpion'] + local_values['l2_loads_power_consumtpion'] + local_values['l3_loads_power_consumtpion']
+            self.logger.debug('Loads total power: ' + str(local_values['loads_total_power']) + ', Loads L1 power: ' + str(local_values['l1_loads_power_consumtpion']) + ', Loads L2 power: ' + str(local_values['l2_loads_power_consumtpion']) + ', Loads L3 power: ' + str(local_values['l3_loads_power_consumtpion'])) 
+                        
+            # Estimation of the power losses from battery/solarcharger to AC loads. It might help the system to better respect the
+            # battery discharge/charge limits.
+            local_values['losses_dc2ac_est'] = (local_values['grid_power_sum'] - local_values['battery_power'] + local_values['solarcharger_power_sum']) - local_values['loads_total_power']
+            self.logger.debug('Estimated losses DC to AC: ' + str(local_values['losses_dc2ac_est']) + 'W')
+                    
+        self.logger.debug('Solarcharger power sum: ' + str(local_values['solarcharger_power_sum']) + ' Solarcharger current sum: ' + str(local_values['solarcharger_current_sum']))
+        if(not local_values['all_CCGX_values_available']):
+            self.logger.info('all_CCGX_values_available: "' + str(local_values['all_CCGX_values_available']) + '"')    # TODO: log level back to debug
         
     def set_CCGX_value(self, set_val_name_str=None, set_val=0, only_set_if_deviation_to_current_setting=True):
         """Function description: Sets the corresponding value in CCGX over MQTT.
