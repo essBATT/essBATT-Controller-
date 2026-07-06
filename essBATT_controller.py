@@ -33,10 +33,11 @@ import threading
 from datetime import datetime, timedelta
 import numbers
 
-# New modular imports (Step 1 + Step 2 of modularization)
+# New modular imports (Step 1-3 of modularization)
 import constants
 from utils import RepeatedTimer
 from config_manager import ConfigManager
+from battery_protection import BatteryProtector
 
 
 ##################### essBATT Controller Class ##############
@@ -79,6 +80,9 @@ class essBATT_controller:
 
         self.logger.setLevel(constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data.get('debug_level', 'INFO')])
         self.logger.info('Effective logger level: ' + str(self.logger.getEffectiveLevel()))
+
+        # Step 3: BatteryProtector for all limit calculations
+        self.battery_protector = BatteryProtector(self.ess_config_data, self.logger)
 
         self.rt_keep_alive_obj = RepeatedTimer(constants.CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
         self.rt_ess_control_update_obj = RepeatedTimer(
@@ -157,25 +161,25 @@ class essBATT_controller:
             self.read_values_to_local_dict(local_values)
                     
             ############# State machine ###################################################
-            # The statemachine handles all tasks associated with switching from "normal_operation" to "charge to SOC" or "balancing" and back.
             try:
                 self.statemachine_update(local_values)
             except Exception as e:
                 self.logger.exception('Unhandled Exception!')
                 raise
+
             ############ Calculate and write output values ################################
             # "Static" settings
-            self.set_CCGX_value(set_val_name_str='MaxFeedInPower', set_val=self.ess_config_data['ess_mode_2_settings']['max_system_grid_feed_in_power_2706'], only_set_if_deviation_to_current_setting=True)
-            self.set_CCGX_value(set_val_name_str='OvervoltageFeedIn', set_val=self.ess_config_data['ess_mode_2_settings']['feed_excess_dc_coupled_pv_into_grid_2707'], only_set_if_deviation_to_current_setting=True)
-            self.set_CCGX_value(set_val_name_str='PreventFeedback', set_val=self.ess_config_data['ess_mode_2_settings']['feed_excess_ac_coupled_pv_into_grid_2708'], only_set_if_deviation_to_current_setting=True)
+            self.set_CCGX_value(set_val_name_str='MaxFeedInPower', set_val=self.ess_config_data.get('ess_mode_2_settings', {}).get('max_system_grid_feed_in_power_2706', 0), only_set_if_deviation_to_current_setting=True)
+            self.set_CCGX_value(set_val_name_str='OvervoltageFeedIn', set_val=self.ess_config_data.get('ess_mode_2_settings', {}).get('feed_excess_dc_coupled_pv_into_grid_2707', 0), only_set_if_deviation_to_current_setting=True)
+            self.set_CCGX_value(set_val_name_str='PreventFeedback', set_val=self.ess_config_data.get('ess_mode_2_settings', {}).get('feed_excess_ac_coupled_pv_into_grid_2708', 0), only_set_if_deviation_to_current_setting=True)
             
-            # Only continue the calculation of the output values if all input values are available
-            if(local_values['all_CCGX_values_available']):
-                # To keep the battery safe in all situations we need to look continuosly at many variables like min- and max cell voltages, SOC, balancing state etc. and adapt the charge- or discharge limits accordingly
+            # Only continue if all input values are available
+            if local_values.get('all_CCGX_values_available', False):
+                # Battery protection limits are now handled by BatteryProtector (Step 3)
                 try:
-                    self.calculate_dis_charge_limits(local_values)
+                    self.battery_protector.calculate_dis_charge_limits(local_values)
                 except Exception as e:
-                    self.logger.exception('Unhandled Exception!')
+                    self.logger.exception('Unhandled Exception in battery protection!')
                     raise
                 # To save some power we want to switch off only the charger, the inverter or the complete multi if it is possible/makes sense
                 # e.g. in winter mode if the battery SOC goes below a threshold we can deactivate the inverter AND charger and activate them again e.g. when balancing occurs etc.
@@ -775,191 +779,8 @@ class essBATT_controller:
             self.logger.error('Unknown "current state". Check ess_controller_state file.')
         pass
     
-    def calculate_dis_charge_limits(self, local_values):
-        local_values['charge_current_limit_regular'] = self.get_charge_current_limit_with_battery_protection()
-        local_values['discharge_current_limit_regular'] = self.get_discharge_current_limit_with_battery_protection()                           
-                      
-        # If a current limit is limiting the battery output power there sometimes is a more or less constant violation of this limit. First we need to calculate the deviation
-        # and if it is configured (ess_config_data['battery_settings']['compensate_current_limit_violations'] == 1) output current is further reduced by this amount
-                    
-        local_values['charge_current_limit_violation'] = False
-        local_values['discharge_current_limit_violation'] = False
-        # Case discharge limit violation
-        if((local_values['battery_current'] < 0.0) and (abs(local_values['battery_current']) > local_values['discharge_current_limit_regular'])):
-            local_values['violation_current'] = abs(local_values['battery_current']) - local_values['discharge_current_limit_regular']
-            local_values['discharge_current_limit_violation'] = True
-        # Case charge limit violation
-        elif((local_values['battery_current'] > 0.0) and (abs(local_values['battery_current']) > local_values['charge_current_limit_regular'])):
-            local_values['violation_current'] = abs(local_values['battery_current']) - local_values['charge_current_limit_regular']
-            local_values['charge_current_limit_violation'] = True
-        else:
-            pass
-                    
-        # For charging the MaxChargeCurrent register 2705 takes all input and outputs into account and can be set directly. For discharging
-        # we can only set the power in register 2704 (MaxDischargePower). To be able to stay within the configurated current bounds we need to calculate
-        # how the current limit maps to the discharge output power limit taking into account also the solarcharger input.       
-        # Max output power Multi                      = (Maximum power the battery is allowed to deliver) + (Current solar input power) 
-        local_values['discharge_power_limit_regular'] = self.calc_discharge_power_limit_from_current(local_values, local_values['discharge_current_limit_regular'])
-        self.logger.debug('Discharge power limit:' + str(local_values['discharge_power_limit_regular']) + 'W.')
-        # If configurated compensate for DC to AC losses (not sure if this is always helpful)
-        if(self.ess_config_data['battery_settings']['compensate_current_limit_violations'] == 1):
-            if(local_values['discharge_current_limit_violation'] is True):
-                local_values['discharge_power_limit_regular'] = local_values['discharge_power_limit_regular'] - (local_values['violation_current'] * local_values['battery_voltage'])
-                self.logger.debug('Discharge power limit violated and compensated by: ' + str(local_values['violation_current']) + 'A. Discharge power limit now: ' + str(local_values['discharge_power_limit_regular']))
-            elif(local_values['charge_current_limit_violation'] is True):
-                local_values['charge_current_limit_regular'] = local_values['charge_current_limit_regular'] - local_values['violation_current']
-                self.logger.debug('Charge current limit violated and compensated by: ' + str(local_values['violation_current']) + 'W. Charge current limit now: ' + str(local_values['charge_current_limit_regular']) + 'A.')
-            else:
-                pass                    
-        self.logger.debug('Max output power multi (regular): ' + str(local_values['discharge_power_limit_regular']))
-        ########## Now we take the special winter limits from ess_config into account #######
-        if('winter_mode' in self.ess_controller_state and self.ess_controller_state['winter_mode'] == 'activated'):
-            if('winter_SOC_discharge_limit' in self.ess_controller_state and self.ess_controller_state['winter_SOC_discharge_limit'] == "activated"):
-                local_values['winter_discharge_limit'] = 0.0
-        ########## Now we take the current ess_controller state given through external commands into account #######
-        # Note that the user can only restrict the (dis)charge limits further and NOT weaken the limits in any way. The limits calculated until here
-        # are the basic battery and system protection. But if a user wants to have stricter limits for balancing or (dis)charging they can be set
-        local_values['external_current_limit_set'] = False
-        if(self.ess_controller_state['current_state'] == 'balancing'):
-            if(self.ess_controller_state['balancing']['max_current'] != 'none'):
-                local_values['external_current_limit'] = self.ess_controller_state['balancing']['max_current']
-                local_values['external_current_limit_set'] = True
-        elif(self.ess_controller_state['current_state'] == 'charge_to_SOC'):
-            if(self.ess_controller_state['charge_to_SOC']['max_current'] != 'none'):
-                local_values['external_current_limit'] = self.ess_controller_state['charge_to_SOC']['max_current']
-                local_values['external_current_limit_set'] = True
-        elif(self.ess_controller_state['current_state'] == 'normal_operation'):
-            # Just here for the 'current_state' string check
-            pass
-        else:
-            self.logger.error('Unknown ess controller state: ' + self.ess_controller_state['current_state'])
-            
-        ####### Now we check if charging or discharging is completely forbidden by external commands #################################
-        if('deactivate_charge' in self.ess_external_input):
-            if(self.ess_external_input['deactivate_charge']['activated']):
-                local_values['deactivate_charge_limit'] = 0.0
-        if('deactivate_discharge' in self.ess_external_input):
-            if(self.ess_external_input['deactivate_discharge']['activated']):
-                local_values['deactivate_discharge_limit'] = 0.0     
-              
-        ####### Now we introduce a new limit based on the (dis)charge_limit_regular, that lets the discharge limit "snap" to the lowest/highest limit the min/max cell voltage has triggered in that cycle to smooth the allowed current
-        if(self.ess_config_data['battery_settings']['smooth_voltage_based_(dis)charge_limits'] == 1):
-            # New limit for discharging
-            # If the regular current limit is smaller than the max battery discharge current we start to hit the discharge limits which we want to control/filter 
-            discharge_regular_limit_diff = local_values['discharge_current_limit_regular'] - self.temporary_script_states['discharge_current_limit_state']
-            # if the current limit is smaller than the limit from the last cycle the difference will be negative --> we hit a new discharge current threshold
-            # Second condition that needs to be true is that we are still discharging and not charging.
-            if((discharge_regular_limit_diff < -0.01) and ((local_values['battery_current'] < 0))):
-                self.temporary_script_states['discharge_current_limit_state'] = local_values['discharge_current_limit_regular']
-                self.logger.info('Discharge current limit got stricter. Now is: ' + str(self.temporary_script_states['discharge_current_limit_state']) + '. discharge_regular_limit_diff: ' + str(discharge_regular_limit_diff) + ', discharge_current_limit_regular: ' + str(local_values['discharge_current_limit_regular']) + ', discharge_current_limit_state: ' + str(self.temporary_script_states['discharge_current_limit_state']))
-            # To have a better reset condition we need to store if we have hit the "zero current" limit
-            if(local_values['discharge_current_limit_regular'] < 0.1):
-                self.temporary_script_states['discharge_current_limit_hit_zero'] = True
-                self.logger.info('discharge_current_limit_hit_zero is True now')
-            # Now that we have the set condition for the 'discharge_current_limit_state' we now need the reset condition:
-            # If the minimum cell voltage gets above the "min_cell_voltage_discharging_resume" from ess_config.json "the discharge limit fixing" done here will be reset
-            if(   (local_values['battery_min_cell_voltage'] > self.ess_config_data['battery_settings']['min_cell_voltage_discharging_resume'] and self.temporary_script_states['discharge_current_limit_hit_zero'] is True)
-                or ((local_values['battery_current'] > constants.DISCHARGE_LIMIT_RESET_CHARGE_CURRENT) and (self.temporary_script_states['discharge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current']))):
-                
-                if((local_values['battery_min_cell_voltage'] > self.ess_config_data['battery_settings']['min_cell_voltage_discharging_resume'] and self.temporary_script_states['discharge_current_limit_hit_zero'] is True) is True):
-                    self.logger.info('Condition that triggered the reset: Min cell voltage above discharge resume voltage and discharge current limit had hit zero before.')
-                if(((local_values['battery_current'] > constants.DISCHARGE_LIMIT_RESET_CHARGE_CURRENT) and (self.temporary_script_states['discharge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current'])) is True):
-                    self.logger.info('Condition that triggered the reset: Battery current above "reset charge current" (internal script parameter) and the stored discharge limit was not yet reset. ' + 'battery_current: ' + str(local_values['battery_current']) + ' discharge_current_limit_state: ' + str(self.temporary_script_states['discharge_current_limit_state']))
-                
-                self.temporary_script_states['discharge_current_limit_state'] = self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current']
-                self.temporary_script_states['discharge_current_limit_hit_zero'] = False
-                self.logger.info('Discharge current limit reset to default value! Now: ' + str(self.temporary_script_states['discharge_current_limit_state']))
-                
-            # New limit for charging
-            # If the regular current limit is smaller than the max battery discharge current we start to hit the discharge limits which we want to control/filter 
-            charge_regular_limit_diff = local_values['charge_current_limit_regular'] - self.temporary_script_states['charge_current_limit_state']
-            # if the current limit is smaller than the limit from the last cycle the difference will be negative --> we hit a new charge current threshold
-            if((charge_regular_limit_diff < -0.01) and (local_values['battery_current'] > 0)):
-                self.temporary_script_states['charge_current_limit_state'] = local_values['charge_current_limit_regular']
-                self.logger.info('Charge current limit got stricter. Now is: ' + str(self.temporary_script_states['charge_current_limit_state'])  + '. discharge_regular_limit_diff: ' + str(charge_regular_limit_diff) + ', charge_current_limit_regular: ' + str(local_values['charge_current_limit_regular']) + ', charge_current_limit_state: ' + str(self.temporary_script_states['charge_current_limit_state']))
-            # To have a better reset condition we need to store if we have hit the "zero current" limit
-            if(local_values['charge_current_limit_regular'] < 0.1):
-                self.temporary_script_states['charge_current_limit_hit_zero'] = True
-                self.logger.info('charge_current_limit_hit_zero is True now')
-            # Now that we have the set condition for the 'charge_current_limit_state' we now need the reset condition:
-            # If the maximum cell voltage gets below the "max_cell_voltage_charging_resume" from ess_config.json and previously has hit the charge limit 0 
-            # OR we have a strong discharge signal "the charge limit fixing" done here will be reset
-            if(   (local_values['battery_max_cell_voltage'] <= self.ess_config_data['battery_settings']['max_cell_voltage_charging_resume'] and self.temporary_script_states['charge_current_limit_hit_zero'] is True)
-                or ((local_values['battery_current'] < constants.CHARGE_LIMIT_RESET_DISCHARGE_CURRENT) and (self.temporary_script_states['charge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']))):
-                
-                if((local_values['battery_max_cell_voltage'] <= self.ess_config_data['battery_settings']['max_cell_voltage_charging_resume'] and self.temporary_script_states['charge_current_limit_hit_zero'] is True)):
-                    self.logger.info('Condition that triggered the reset: Max cell voltage below charge resume voltage and charge current limit had hit zero before.')
-                if(((local_values['battery_current'] < constants.CHARGE_LIMIT_RESET_DISCHARGE_CURRENT) and (self.temporary_script_states['charge_current_limit_state'] < self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']))):
-                    self.logger.info('Condition that triggered the reset: Battery current above "reset discharge current" (internal script parameter) and the stored charge limit was not yet reset.')
-                
-                self.temporary_script_states['charge_current_limit_state'] = self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']
-                self.temporary_script_states['charge_current_limit_hit_zero'] = False
-                self.logger.info('Charge current limit reset to default value! Now: ' + str(self.temporary_script_states['charge_current_limit_state']))
-
-        ###### Now bring all limits together and aggregate the final limits ##########################################################
-        
-        # Append all valid charge current limits
-        charge_current_limits_list = []
-        info_str = ''
-        if('charge_current_limit_regular' in local_values):
-            charge_current_limits_list.append(local_values['charge_current_limit_regular'])
-            info_str = info_str + 'charge_current_limit_regular, '
-        if('external_current_limit' in local_values):
-            charge_current_limits_list.append(local_values['external_current_limit'])
-            info_str = info_str + 'external_current_limit, '
-        if('deactivate_charge_limit' in local_values):
-            charge_current_limits_list.append(local_values['deactivate_charge_limit'])
-            info_str = info_str + 'deactivate_charge_limit, '
-        if('charge_current_limit_state' in self.temporary_script_states):
-            charge_current_limits_list.append(self.temporary_script_states['charge_current_limit_state'])
-            info_str = info_str + 'charge_current_limit_state'
-        if charge_current_limits_list:
-            local_values['charge_current_limit_final'] = min(charge_current_limits_list)
-            self.logger.debug('charge_current_limit_final: ' + str(local_values['charge_current_limit_final']) + ' from list: ' + ','.join(map(str, charge_current_limits_list)) + ' (' + info_str + ').')
-        else:
-            self.logger.error('Determination of charge current limits failed: no limits in list')
-        # Append all valid discharge current limits
-        discharge_current_limits_list = []
-        info_str = ''
-        if('discharge_current_limit_regular' in local_values):
-            discharge_current_limits_list.append(local_values['discharge_current_limit_regular'])    
-        if('external_current_limit' in local_values):
-            discharge_current_limits_list.append(local_values['external_current_limit'])
-        if('winter_discharge_limit' in local_values):
-            discharge_current_limits_list.append(local_values['winter_discharge_limit'])
-        if('discharge_current_limit_state' in self.temporary_script_states):
-            discharge_current_limits_list.append(self.temporary_script_states['discharge_current_limit_state'])
-        if discharge_current_limits_list:
-            local_values['discharge_current_limit_final'] = min(discharge_current_limits_list)
-        else:
-            self.logger.error('Determination of discharge current limits failed: no limits in list')
-        # Append all valid discharge power limits
-        discharge_power_limits_list = []
-        if('discharge_power_limit_regular' in local_values):
-            discharge_power_limits_list.append(local_values['discharge_power_limit_regular'])
-            info_str = info_str + 'discharge_power_limit_regular, '
-        if('external_current_limit' in local_values):
-            discharge_power_limit_external = self.calc_discharge_power_limit_from_current(local_values, local_values['external_current_limit'])
-            discharge_power_limits_list.append(discharge_power_limit_external)
-            info_str = info_str + 'external_current_limit, '
-        if('deactivate_discharge_limit' in local_values):
-            discharge_power_limit_deactivated = self.calc_discharge_power_limit_from_current(local_values, local_values['deactivate_discharge_limit'])
-            discharge_power_limits_list.append(discharge_power_limit_deactivated)
-            info_str = info_str + 'deactivate_discharge_limit, '
-        if('winter_discharge_limit' in local_values):
-            discharge_power_limit_winter = self.calc_discharge_power_limit_from_current(local_values, local_values['winter_discharge_limit'])
-            discharge_power_limits_list.append(discharge_power_limit_winter)
-            info_str = info_str + 'winter_discharge_limit, '
-        if('discharge_current_limit_state' in self.temporary_script_states):
-            discharge_power_limit_regular_state = self.calc_discharge_power_limit_from_current(local_values, self.temporary_script_states['discharge_current_limit_state'])
-            discharge_power_limits_list.append(discharge_power_limit_regular_state)
-            info_str = info_str + 'discharge_current_limit_state'
-        if discharge_power_limits_list:
-            local_values['discharge_power_limit_final'] = int(min(discharge_power_limits_list))
-            self.logger.debug('discharge_power_limit_final: ' + str(local_values['discharge_power_limit_final']) + ' from list: ' + ','.join(map(str, discharge_power_limits_list)) + '(' + info_str + ').')
-        else:
-            self.logger.error('Determination of discharge power limits failed: no limits in list')
-            
+    # All battery limit calculation methods (calculate_dis_charge_limits, get_charge_..., get_discharge_..., calc_discharge_power_limit...) 
+    # have been moved to BatteryProtector (Step 3). The controller now calls self.battery_protector.calculate_dis_charge_limits(local_values)
         # Store values from this cycle as information for next cycle
         self.temporary_script_states['discharge_regular_current_limit_last_cycle'] = local_values['discharge_current_limit_regular']
 
@@ -967,204 +788,8 @@ class essBATT_controller:
         # Max output power Multi = (Maximum power the battery is allowed to deliver      ) + (Current solar input power) 
         return                     ((abs(input_current * local_values['battery_voltage'])) + local_values['solarcharger_power_sum'])
     
-    def read_values_to_local_dict(self, local_values):
-        local_values['all_CCGX_values_available'] = True
-        if('grid_power_sum' in self.CCGX_data['grid']):
-            local_values['grid_power_sum'] = self.CCGX_data['grid']['grid_power_sum']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('soc' in self.CCGX_data['battery']):
-            local_values['battery_soc'] = self.CCGX_data['battery']['soc']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('max_cell_voltage' in self.CCGX_data['battery']):
-            local_values['battery_max_cell_voltage'] = self.CCGX_data['battery']['max_cell_voltage']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('min_cell_voltage' in self.CCGX_data['battery']):
-            local_values['battery_min_cell_voltage'] = self.CCGX_data['battery']['min_cell_voltage']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('current' in self.CCGX_data['battery']):
-            local_values['battery_current'] = self.CCGX_data['battery']['current']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('power' in self.CCGX_data['battery']):
-            local_values['battery_power'] = self.CCGX_data['battery']['power']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('voltage' in self.CCGX_data['battery']):
-            local_values['battery_voltage'] = self.CCGX_data['battery']['voltage']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('L1_loads_power_consumption' in self.CCGX_data['system']):
-            local_values['l1_loads_power_consumtpion'] = self.CCGX_data['system']['L1_loads_power_consumption']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('L2_loads_power_consumption' in self.CCGX_data['system']):
-            local_values['l2_loads_power_consumtpion'] = self.CCGX_data['system']['L2_loads_power_consumption']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('L3_loads_power_consumption' in self.CCGX_data['system']):
-            local_values['l3_loads_power_consumtpion'] = self.CCGX_data['system']['L3_loads_power_consumption']
-        else:
-            local_values['all_CCGX_values_available'] = False
-                
-        local_values['solarcharger_power_sum'] = 0    
-        for element in self.CCGX_data['solarcharger']:
-            if('Power' in self.CCGX_data['solarcharger'][element]):
-                local_values['solarcharger_power_sum'] = local_values['solarcharger_power_sum'] + self.CCGX_data['solarcharger'][element]['Power']
-            else:
-                local_values['all_CCGX_values_available'] = False
-        local_values['solarcharger_current_sum'] = 0    
-        for element in self.CCGX_data['solarcharger']:
-            if('Current' in self.CCGX_data['solarcharger'][element]):
-                local_values['solarcharger_current_sum'] = local_values['solarcharger_current_sum'] + self.CCGX_data['solarcharger'][element]['Current']
-            else:
-                local_values['all_CCGX_values_available'] = False
-        
-        if(local_values['all_CCGX_values_available']):        
-            # Total loads power consumption
-            local_values['loads_total_power'] = local_values['l1_loads_power_consumtpion'] + local_values['l2_loads_power_consumtpion'] + local_values['l3_loads_power_consumtpion']
-            self.logger.debug('Loads total power: ' + str(local_values['loads_total_power']) + ', Loads L1 power: ' + str(local_values['l1_loads_power_consumtpion']) + ', Loads L2 power: ' + str(local_values['l2_loads_power_consumtpion']) + ', Loads L3 power: ' + str(local_values['l3_loads_power_consumtpion'])) 
-                        
-            # Estimation of the power losses from battery/solarcharger to AC loads. It might help the system to better respect the
-            # battery discharge/charge limits.
-            local_values['losses_dc2ac_est'] = (local_values['grid_power_sum'] - local_values['battery_power'] + local_values['solarcharger_power_sum']) - local_values['loads_total_power']
-            self.logger.debug('Estimated losses DC to AC: ' + str(local_values['losses_dc2ac_est']) + 'W')
-                    
-        self.logger.debug('Solarcharger power sum: ' + str(local_values['solarcharger_power_sum']) + ' Solarcharger current sum: ' + str(local_values['solarcharger_current_sum']))
-        if(not local_values['all_CCGX_values_available']):
-            self.logger.info('all_CCGX_values_available: "' + str(local_values['all_CCGX_values_available']) + '"')    # TODO: log level back to debug
-        
-    def get_charge_current_limit_with_battery_protection(self):
-        current_charge_limit = 0.0
-        soc_or_max_cell_limit_set = False
-        if(('max_cell_voltage' in self.CCGX_data['battery']) and ('soc' in self.CCGX_data['battery'])):
-            battery_max_cell_voltage = self.CCGX_data['battery']['max_cell_voltage']
-            battery_soc = self.CCGX_data['battery']['soc']
-            
-            # Stop charging if max voltage is reached for one cell
-            if(battery_max_cell_voltage >= self.ess_config_data['battery_settings']['max_cell_voltage_charging']):
-                current_charge_limit = 0.0
-            else:
-                # Check the other conditions
-                try:
-                    # SOC based limits
-                    soc_based_current_charge_limit = -1.0
-                    for list_index, soc_limit in enumerate(self.ess_config_data['battery_settings']['soc_based_charge_limit_soc_array']):
-                        if(battery_soc >= soc_limit):
-                            soc_based_current_charge_limit = self.ess_config_data['battery_settings']['soc_based_charge_limit_current_array'][list_index]
-                    # Max cell voltage based limits
-                    max_cell_based_current_charge_limit = -1.0
-                    for list_index, max_cell_limit in enumerate(self.ess_config_data['battery_settings']['max_cell_based_charge_limit_voltage_array']):
-                        if(battery_max_cell_voltage >= max_cell_limit):
-                            max_cell_based_current_charge_limit = self.ess_config_data['battery_settings']['max_cell_based_charge_limit_current_array'][list_index]
-                    # Now lets do the final limit aggregation
-                    if(self.ess_config_data['battery_settings']['charge_limit_mode'] == 'soc_and_max_cell'):
-                        if(soc_based_current_charge_limit >= 0.0 and max_cell_based_current_charge_limit >= 0.0):
-                            current_charge_limit = min(soc_based_current_charge_limit, max_cell_based_current_charge_limit)
-                            soc_or_max_cell_limit_set = True
-                            self.logger.debug('Charge current limit SOC and Max Cell (both limits active) (' + self.ess_config_data['battery_settings']['charge_limit_mode'] + ') with current_charge_limit ' + str(current_charge_limit))
-                        elif(soc_based_current_charge_limit >= 0.0):
-                            current_charge_limit = soc_based_current_charge_limit
-                            soc_or_max_cell_limit_set = True
-                            self.logger.debug('Charge current limit SOC and Max Cell (only SOC limit active) (' + self.ess_config_data['battery_settings']['charge_limit_mode'] + ') with current_charge_limit ' + str(current_charge_limit))
-                        elif(max_cell_based_current_charge_limit >= 0.0):
-                            current_charge_limit = max_cell_based_current_charge_limit
-                            soc_or_max_cell_limit_set = True
-                            self.logger.debug('Charge current limit SOC and Max Cell (only Max Cell limit active) (' + self.ess_config_data['battery_settings']['charge_limit_mode'] + ') with current_charge_limit ' + str(current_charge_limit))
-                        else:
-                            pass #can not occur
-                    elif(self.ess_config_data['battery_settings']['charge_limit_mode'] == 'soc_only'):
-                        if(soc_based_current_charge_limit >= 0.0):
-                            current_charge_limit = soc_based_current_charge_limit
-                            soc_or_max_cell_limit_set = True
-                            self.logger.debug('Charge current limit SOC only (' + self.ess_config_data['battery_settings']['charge_limit_mode'] + ') with current_charge_limit ' + str(current_charge_limit))
-                    elif(self.ess_config_data['battery_settings']['charge_limit_mode'] == 'max_cell_only'):
-                        if(max_cell_based_current_charge_limit >= 0.0):
-                            current_charge_limit = max_cell_based_current_charge_limit
-                            soc_or_max_cell_limit_set = True
-                            self.logger.debug('Charge current limit Max Cell Only (' + self.ess_config_data['battery_settings']['charge_limit_mode'] + ') with current_charge_limit ' + str(current_charge_limit))
-                    else:
-                        self.logger.error('Charge limit mode not unknown in ess_config.json. You entered value: ' + self.ess_config_data['battery_settings']['charge_limit_mode'])
-                except (IndexError, TypeError, KeyError) as e:
-                    self.logger.error('Invalid charge limit arrays in ess_config.json (ascending order, equal length): ' + str(e))
-                    return current_charge_limit  
-                # The last step is to take the configured maximum charge limit into account
-                if(soc_or_max_cell_limit_set is True):
-                    current_charge_limit = min(self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705'], current_charge_limit)
-                else:
-                    current_charge_limit = self.ess_config_data['ess_mode_2_settings']['max_battery_charge_current_2705']            
-        else:
-            self.logger.warning('Either max_cell_voltage or soc was not available!')
-        self.logger.debug('Current charge limit: ' + str(current_charge_limit) + 'A')
-        return current_charge_limit
-    
-    
-    def get_discharge_current_limit_with_battery_protection(self):
-        current_discharge_limit = 0.0
-        soc_or_min_cell_limit_set = False
-        if(('min_cell_voltage' in self.CCGX_data['battery']) and ('soc' in self.CCGX_data['battery'])):
-            battery_min_cell_voltage = self.CCGX_data['battery']['min_cell_voltage']
-            battery_soc = self.CCGX_data['battery']['soc']
-            
-            # Stop discharging if min voltage is reached for one cell
-            if(battery_min_cell_voltage <= self.ess_config_data['battery_settings']['min_cell_voltage_discharging']):
-                current_discharge_limit = 0.0
-            else:
-                # Check the other conditions
-                try:
-                    # SOC based limits
-                    soc_based_current_discharge_limit = -1.0
-                    for list_index, soc_limit in enumerate(self.ess_config_data['battery_settings']['soc_based_discharge_limit_soc_array']):
-                        if(battery_soc <= soc_limit):
-                            soc_based_current_discharge_limit = self.ess_config_data['battery_settings']['soc_based_discharge_limit_current_array'][list_index]
-                    # Min cell voltage based limits
-                    min_cell_based_current_discharge_limit = -1.0
-                    for list_index, min_cell_limit in enumerate(self.ess_config_data['battery_settings']['min_cell_based_discharge_limit_voltage_array']):
-                        if(battery_min_cell_voltage <= min_cell_limit):
-                            min_cell_based_current_discharge_limit = self.ess_config_data['battery_settings']['min_cell_based_discharge_limit_current_array'][list_index]
-                    # Now lets do the final limit aggregation
-                    if(self.ess_config_data['battery_settings']['discharge_limit_mode'] == 'soc_and_min_cell'):
-                        if(soc_based_current_discharge_limit >= 0.0 and min_cell_based_current_discharge_limit >= 0.0):
-                            current_discharge_limit = min(soc_based_current_discharge_limit, min_cell_based_current_discharge_limit)
-                            soc_or_min_cell_limit_set = True
-                            self.logger.debug('Discharge current limit SOC and Min Cell (both limits active) (' + self.ess_config_data['battery_settings']['discharge_limit_mode'] + ') with current_discharge_limit ' + str(current_discharge_limit))
-                        elif(soc_based_current_discharge_limit >= 0.0):
-                            current_discharge_limit = soc_based_current_discharge_limit
-                            soc_or_min_cell_limit_set = True
-                            self.logger.debug('Discharge current limit SOC and Min Cell (only SOC limit active) (' + self.ess_config_data['battery_settings']['discharge_limit_mode'] + ') with current_discharge_limit ' + str(current_discharge_limit))
-                        elif(min_cell_based_current_discharge_limit >= 0.0):
-                            current_discharge_limit = min_cell_based_current_discharge_limit
-                            soc_or_min_cell_limit_set = True
-                            self.logger.debug('Discharge current limit SOC and Min Cell (only Min Cell limit active) (' + self.ess_config_data['battery_settings']['discharge_limit_mode'] + ') with current_discharge_limit ' + str(current_discharge_limit))
-                        else:
-                            pass #can not occur                            
-                    elif(self.ess_config_data['battery_settings']['discharge_limit_mode'] == 'soc_only'):
-                        if(soc_based_current_discharge_limit >= 0.0):
-                            current_discharge_limit = soc_based_current_discharge_limit
-                            soc_or_min_cell_limit_set = True
-                            self.logger.debug('Discharge current limit SOC only. (' + self.ess_config_data['battery_settings']['discharge_limit_mode'] + ') with current_discharge_limit ' + str(current_discharge_limit))
-                    elif(self.ess_config_data['battery_settings']['discharge_limit_mode'] == 'min_cell_only'):
-                        if(min_cell_based_current_discharge_limit >= 0.0):
-                            current_discharge_limit = min_cell_based_current_discharge_limit
-                            soc_or_min_cell_limit_set = True
-                            self.logger.debug('Discharge current limit Min Cell only. (' + self.ess_config_data['battery_settings']['discharge_limit_mode'] + ') with current_discharge_limit ' + str(current_discharge_limit))
-                    else:
-                        self.logger.error('Discharge limit mode not unknown in ess_config.json. You entered value: ' + self.ess_config_data['battery_settings']['discharge_limit_mode'])
-                except (IndexError, TypeError, KeyError) as e:
-                    self.logger.error('Invalid discharge limit arrays in ess_config.json (descending order, equal length): ' + str(e))
-                    return current_discharge_limit  
-                # The last step is to take the configured maximum charge limit into account
-                if(soc_or_min_cell_limit_set is True):
-                    current_discharge_limit = min(self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current'], current_discharge_limit)
-                else:
-                    current_discharge_limit = self.ess_config_data['ess_mode_2_settings']['max_battery_discharge_current']           
-        else:
-            self.logger.warning('Either min_cell_voltage or soc was not available!')
-        self.logger.debug('Current discharge limit: ' + str(current_discharge_limit) + 'A')
-        return current_discharge_limit
+    # read_values_to_local_dict() remains in controller for now (will be refactored in later step).
+    # All battery limit methods (get_charge_..., get_discharge_..., calculate_dis_charge_limits) have been moved to BatteryProtector (Step 3).
         
     def set_CCGX_value(self, set_val_name_str=None, set_val=0, only_set_if_deviation_to_current_setting=True):
         """Function description: Sets the corresponding value in CCGX over MQTT.
