@@ -4,7 +4,7 @@ Uses fixtures from conftest.py for sample data and temporary directories.
 """
 
 import json
-from unittest.mock import mock_open, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
@@ -78,7 +78,7 @@ def test_create_temporary_script_states(sample_config, mocked_logger):
 def test_save_state_if_changed(mocked_logger):
     """Test conditional save only when state actually changed."""
     manager = ConfigManager(mocked_logger)
-    manager.save_state = mocked_logger.mock_save  # will be asserted via call count
+    manager.save_state = MagicMock(return_value=True)
 
     state1 = {"current_state": "normal_operation"}
     state2 = {"current_state": "balancing"}
@@ -89,4 +89,4 @@ def test_save_state_if_changed(mocked_logger):
     changed = manager.save_state_if_changed(state2, state1)
 
     assert changed is True
-    # mocked_logger.mock_save would be called only once (on change)
+    manager.save_state.assert_called_once()

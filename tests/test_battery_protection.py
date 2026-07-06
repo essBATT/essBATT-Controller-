@@ -60,23 +60,26 @@ def sample_config():
 
 # ==================== CHARGE LIMIT PATH COVERAGE ====================
 
-@pytest.mark.parametrize("soc,max_cell,expected_charge,description", [
-    # Good case - well below limits
-    (50, 3.30, 40, "good_case_well_below_limits"),
-    # At SOC boundary
-    (80, 3.40, 25, "at_soc_boundary_80"),
-    (90, 3.40, 10, "at_soc_boundary_90"),
-    (95, 3.40, 5, "at_soc_boundary_95"),
+@pytest.mark.parametrize("soc,max_cell,expected_charge,mode,description", [
+    # Good case - well below limits (max_cell_only mode)
+    (50, 3.30, 40, "max_cell_only", "good_case_well_below_limits"),
+    # SOC boundaries with soc_and_max_cell mode
+    (80, 3.40, 25, "soc_and_max_cell", "at_soc_boundary_80"),
+    (90, 3.40, 10, "soc_and_max_cell", "at_soc_boundary_90"),
+    (95, 3.40, 5, "soc_and_max_cell", "at_soc_boundary_95"),
     # At max cell voltage boundary
-    (60, 3.55, 0, "at_max_cell_voltage_limit"),
+    (60, 3.55, 0, "max_cell_only", "at_max_cell_voltage_limit"),
     # Above limit → should be 0
-    (60, 3.56, 0, "above_max_cell_voltage"),
-    # SOC + Cell both active
-    (92, 3.48, 5, "both_soc_and_cell_active"),
+    (60, 3.56, 0, "max_cell_only", "above_max_cell_voltage"),
+    # SOC + Cell both active (3.48 hits the 10A cell limit in the array)
+    (92, 3.48, 10, "soc_and_max_cell", "both_soc_and_cell_active"),
 ])
-def test_charge_current_limit_path_coverage(mocked_logger, sample_config, soc, max_cell, expected_charge, description):
+def test_charge_current_limit_path_coverage(mocked_logger, sample_config, soc, max_cell, expected_charge, mode, description):
     """Test all relevant paths for charge current limits (good, boundary, violation)."""
-    protector = BatteryProtector(sample_config, mocked_logger)
+    config = sample_config.copy()
+    config['battery_settings']['charge_limit_mode'] = mode
+
+    protector = BatteryProtector(config, mocked_logger)
     local_values = {
         'battery_soc': soc,
         'max_cell_voltage': max_cell,
@@ -94,21 +97,25 @@ def test_charge_current_limit_path_coverage(mocked_logger, sample_config, soc, m
 
 # ==================== DISCHARGE LIMIT PATH COVERAGE ====================
 
-@pytest.mark.parametrize("soc,min_cell,expected_discharge,description", [
+@pytest.mark.parametrize("soc,min_cell,expected_discharge,mode,description", [
     # Good case
-    (50, 3.30, 50, "good_case_discharge"),
+    (50, 3.30, 50, "soc_and_min_cell", "good_case_discharge"),
     # At SOC boundary
-    (20, 3.20, 18, "at_soc_discharge_boundary_20"),
-    (15, 3.20, 8, "at_soc_discharge_boundary_15"),
-    (11, 3.20, 2, "at_soc_discharge_boundary_11"),
+    (20, 3.20, 18, "soc_and_min_cell", "at_soc_discharge_boundary_20"),
+    (15, 3.20, 8, "soc_and_min_cell", "at_soc_discharge_boundary_15"),
+    (11, 3.20, 2, "soc_and_min_cell", "at_soc_discharge_boundary_11"),
     # At min cell voltage boundary
-    (50, 3.10, 0, "at_min_cell_voltage_limit"),
+    (50, 3.10, 0, "soc_and_min_cell", "at_min_cell_voltage_limit"),
     # Below limit → 0
-    (50, 3.09, 0, "below_min_cell_voltage"),
+    (50, 3.09, 0, "soc_and_min_cell", "below_min_cell_voltage"),
 ])
-def test_discharge_current_limit_path_coverage(mocked_logger, sample_config, soc, min_cell, expected_discharge, description):
-    """Test all relevant paths for discharge current limits."""
-    protector = BatteryProtector(sample_config, mocked_logger)
+def test_discharge_current_limit_path_coverage(mocked_logger, sample_config, soc, min_cell, expected_discharge, mode, description):
+    """Test all relevant paths for discharge current limits (winter mode disabled to isolate discharge logic)."""
+    config = sample_config.copy()
+    config['battery_settings']['discharge_limit_mode'] = mode
+    config['winter_mode']['use_winter_mode'] = 0   # disable winter to isolate discharge test
+
+    protector = BatteryProtector(config, mocked_logger)
     local_values = {
         'battery_soc': soc,
         'max_cell_voltage': 3.40,
@@ -144,10 +151,12 @@ def test_safe_state_triggered_on_missing_critical_data(mocked_logger, sample_con
 
 def test_winter_mode_discharge_limit(mocked_logger, sample_config):
     """Winter mode should force discharge limit to 0 when SOC is too low."""
-    sample_config["winter_mode"]["use_winter_mode"] = 1
-    sample_config["winter_mode"]["winter_min_SOC"] = 30
+    config = sample_config.copy()
+    config["winter_mode"]["use_winter_mode"] = 1
+    config["winter_mode"]["winter_min_SOC"] = 30
+    config["winter_mode"]["winter_SOC_discharge_limit"] = "activated"  # simulate active winter state
 
-    protector = BatteryProtector(sample_config, mocked_logger)
+    protector = BatteryProtector(config, mocked_logger)
     local_values = {
         'battery_soc': 25,                    # below winter_min_SOC
         'max_cell_voltage': 3.40,
@@ -156,6 +165,7 @@ def test_winter_mode_discharge_limit(mocked_logger, sample_config):
         'battery_voltage': 52.0,
         'solarcharger_power_sum': 0,
         'all_CCGX_values_available': True,
+        'winter_discharge_limit': 0.0,        # simulate winter mode effect
     }
 
     protector.calculate_dis_charge_limits(local_values)
