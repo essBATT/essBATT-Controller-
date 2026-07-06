@@ -23,15 +23,22 @@ class BatteryProtector:
             "winter_mode_inactive_charge_begin_time": None,
             "emergency_(dis)charge_begin_time": None,
             "winter_mode_charge_begin_time": None,
-            "discharge_current_limit_state": self.config.get('ess_mode_2_settings', {}).get('max_battery_discharge_current', 5.0),
+            "discharge_current_limit_state": self.config.get('ess_mode_2_settings', {}).get(
+                'max_battery_discharge_current', constants.DEFAULT_MAX_BATTERY_DISCHARGE_CURRENT),
             "discharge_current_limit_hit_zero": False,
-            "charge_current_limit_state": self.config.get('ess_mode_2_settings', {}).get('max_battery_charge_current_2705', 5.0),
+            "charge_current_limit_state": self.config.get('ess_mode_2_settings', {}).get(
+                'max_battery_charge_current_2705', constants.DEFAULT_MAX_BATTERY_CHARGE_CURRENT),
             "charge_current_limit_hit_zero": False,
             "discharge_regular_current_limit_last_cycle": 0.0,
         }
+        self.safe_state_active = False
 
     def calculate_dis_charge_limits(self, local_values):
         """Main entry point for limit calculation (called from controller cycle)."""
+        if not self._validate_required_data(local_values):
+            self.enter_safe_state(local_values, reason="Missing critical battery data (SOC or cell voltages)")
+            return local_values
+
         local_values['charge_current_limit_regular'] = self.get_charge_current_limit_with_battery_protection(local_values)
         local_values['discharge_current_limit_regular'] = self.get_discharge_current_limit_with_battery_protection(local_values)
 
@@ -54,6 +61,27 @@ class BatteryProtector:
 
         return local_values
 
+    def _validate_required_data(self, local_values):
+        """Check if all critical battery data is available."""
+        required = ['min_cell_voltage', 'max_cell_voltage', 'battery_soc', 'battery_current', 'battery_voltage']
+        for key in required:
+            if key not in local_values:
+                return False
+        return True
+
+    def enter_safe_state(self, local_values, reason="Unknown reason"):
+        """Explicit method to enter safe state (zero charge/discharge, clear setpoints).
+
+        This makes the intention very clear in the code and can be reused from anywhere.
+        """
+        self.safe_state_active = True
+        local_values['charge_current_limit_final'] = 0.0
+        local_values['discharge_current_limit_final'] = 0.0
+        local_values['discharge_power_limit_final'] = 0
+        local_values['AcPowerSetPoint'] = 0
+        self.logger.error(f'ENTERING SAFE STATE - Reason: {reason}. All charge/discharge disabled.')
+        # TODO: Could also trigger multis switch to "Off" (position 4) here in future
+
     def get_charge_current_limit_with_battery_protection(self, local_values):
         """SOC and max-cell based charge current limit calculation."""
         current_charge_limit = 0.0
@@ -64,7 +92,11 @@ class BatteryProtector:
         battery_max_cell_voltage = local_values['max_cell_voltage']
         battery_soc = local_values['battery_soc']
 
-        if battery_max_cell_voltage >= self.config.get('battery_settings', {}).get('max_cell_voltage_charging', 3.55):
+        max_cell_voltage_charging = self.config.get('battery_settings', {}).get('max_cell_voltage_charging')
+        if max_cell_voltage_charging is None:
+            self.enter_safe_state(local_values, reason="max_cell_voltage_charging missing in config")
+            return 0.0
+        if battery_max_cell_voltage >= max_cell_voltage_charging:
             return 0.0
 
         try:
@@ -108,7 +140,11 @@ class BatteryProtector:
         battery_min_cell_voltage = local_values['min_cell_voltage']
         battery_soc = local_values['battery_soc']
 
-        if battery_min_cell_voltage <= self.config.get('battery_settings', {}).get('min_cell_voltage_discharging', 3.1):
+        min_cell_voltage_discharging = self.config.get('battery_settings', {}).get('min_cell_voltage_discharging')
+        if min_cell_voltage_discharging is None:
+            self.enter_safe_state(local_values, reason="min_cell_voltage_discharging missing in config")
+            return 0.0
+        if battery_min_cell_voltage <= min_cell_voltage_discharging:
             return 0.0
 
         try:
