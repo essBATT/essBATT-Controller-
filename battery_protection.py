@@ -64,7 +64,7 @@ class BatteryProtector:
         battery_max_cell_voltage = local_values['max_cell_voltage']
         battery_soc = local_values['battery_soc']
 
-        if battery_max_cell_voltage >= self.config['battery_settings']['max_cell_voltage_charging']:
+        if battery_max_cell_voltage >= self.config.get('battery_settings', {}).get('max_cell_voltage_charging', 3.55):
             return 0.0
 
         try:
@@ -93,19 +93,22 @@ class BatteryProtector:
             current_charge_limit = self.config.get('ess_mode_2_settings', {}).get('max_battery_charge_current_2705', 5.0)
 
         self.logger.debug(f'Charge current limit calculated: {current_charge_limit}A')
-        return current_charge_limit
+        return current_charge_limit if current_charge_limit is not None else constants.DEFAULT_MAX_BATTERY_CHARGE_CURRENT
 
     def get_discharge_current_limit_with_battery_protection(self, local_values):
         """SOC and min-cell based discharge current limit calculation."""
         current_discharge_limit = 0.0
         if ('min_cell_voltage' not in local_values or 'battery_soc' not in local_values):
             self.logger.warning('min_cell_voltage or soc not available for discharge limit!')
-            return self.config.get('ess_mode_2_settings', {}).get('max_battery_discharge_current', 5.0)
+            return self.config.get('ess_mode_2_settings', {}).get(
+                'max_battery_discharge_current', 
+                constants.DEFAULT_MAX_BATTERY_DISCHARGE_CURRENT
+            )
 
         battery_min_cell_voltage = local_values['min_cell_voltage']
         battery_soc = local_values['battery_soc']
 
-        if battery_min_cell_voltage <= self.config['battery_settings']['min_cell_voltage_discharging']:
+        if battery_min_cell_voltage <= self.config.get('battery_settings', {}).get('min_cell_voltage_discharging', 3.1):
             return 0.0
 
         try:
@@ -133,7 +136,7 @@ class BatteryProtector:
             current_discharge_limit = self.config.get('ess_mode_2_settings', {}).get('max_battery_discharge_current', 5.0)
 
         self.logger.debug(f'Discharge current limit calculated: {current_discharge_limit}A')
-        return current_discharge_limit
+        return current_discharge_limit if current_discharge_limit is not None else constants.DEFAULT_MAX_BATTERY_DISCHARGE_CURRENT
 
     def calc_discharge_power_limit_from_current(self, local_values, input_current):
         """Convert current limit to power limit taking solar into account."""

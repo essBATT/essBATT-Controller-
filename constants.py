@@ -21,3 +21,7 @@ MULTIS_SWITCH_NUMBER_STRING_MAPPING = {
     '3': "INVERTER AND CHARGER ON",
     '4': "INVERTER AND CHARGER OFF"
 }
+
+# Safe default values when config is missing or incomplete (no magic numbers in business logic)
+DEFAULT_MAX_BATTERY_DISCHARGE_CURRENT = 5.0
+DEFAULT_MAX_BATTERY_CHARGE_CURRENT = 5.0
