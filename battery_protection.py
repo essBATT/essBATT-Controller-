@@ -200,6 +200,10 @@ class BatteryProtector:
             discharge_limits.append(local_values['external_current_limit'])
         if 'winter_discharge_limit' in local_values:
             discharge_limits.append(local_values['winter_discharge_limit'])
+        if 'deactivate_charge_limit' in local_values:
+            charge_limits.append(local_values['deactivate_charge_limit'])
+        if 'deactivate_discharge_limit' in local_values:
+            discharge_limits.append(local_values['deactivate_discharge_limit'])
 
         local_values['charge_current_limit_final'] = min(charge_limits)
         local_values['discharge_current_limit_final'] = min(discharge_limits)

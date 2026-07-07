@@ -33,11 +33,12 @@ import threading
 from datetime import datetime, timedelta
 import numbers
 
-# New modular imports (Step 1-3 of modularization)
+# New modular imports (Step 1-4 of modularization)
 import constants
 from utils import RepeatedTimer
 from config_manager import ConfigManager
 from battery_protection import BatteryProtector
+from state_machine import StateMachine
 
 
 ##################### essBATT Controller Class ##############
@@ -81,8 +82,20 @@ class essBATT_controller:
         self.logger.setLevel(constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data.get('debug_level', 'INFO')])
         self.logger.info('Effective logger level: ' + str(self.logger.getEffectiveLevel()))
 
+        # Create temporary (non-persisted) script states early (used by StateMachine + BatteryProtector logic)
+        self.temporary_script_states = self.config_manager.create_temporary_script_states(self.ess_config_data)
+
         # Step 3: BatteryProtector for all limit calculations
         self.battery_protector = BatteryProtector(self.ess_config_data, self.logger)
+
+        # Step 4: StateMachine
+        self.state_machine = StateMachine(
+            self.ess_config_data,
+            self.logger,
+            self.ess_controller_state,
+            self.temporary_script_states,
+            self.ess_external_input
+        )
 
         self.rt_keep_alive_obj = RepeatedTimer(constants.CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
         self.rt_ess_control_update_obj = RepeatedTimer(
@@ -92,7 +105,6 @@ class essBATT_controller:
             self.ess_config_data.get('script_alive_logging_interval', 86400),
             self.print_alive_status_to_logger
         )
-        self.temporary_script_states = self.config_manager.create_temporary_script_states(self.ess_config_data)
     
     # Note: create_temporary_script_states_dict() has been moved to ConfigManager.
     # The call now happens through self.config_manager.create_temporary_script_states(...)
@@ -159,10 +171,16 @@ class essBATT_controller:
             # Reading most often needed values to local variables for convenience (while checking if they are available)
             local_values = {}
             self.read_values_to_local_dict(local_values)
+
+            # Ported: external deactivate flags affect limits (used by protector + multis_switch)
+            if self.ess_external_input.get('deactivate_charge', {}).get('activated'):
+                local_values['deactivate_charge_limit'] = 0.0
+            if self.ess_external_input.get('deactivate_discharge', {}).get('activated'):
+                local_values['deactivate_discharge_limit'] = 0.0
                     
-            ############# State machine ###################################################
+            ############# State machine (Step 4) ##########################################
             try:
-                self.statemachine_update(local_values)
+                self.state_machine.update(local_values)
             except Exception as e:
                 self.logger.exception('Unhandled Exception!')
                 raise
@@ -184,7 +202,10 @@ class essBATT_controller:
                 # To save some power we want to switch off only the charger, the inverter or the complete multi if it is possible/makes sense
                 # e.g. in winter mode if the battery SOC goes below a threshold we can deactivate the inverter AND charger and activate them again e.g. when balancing occurs etc.
                 try:
-                    self.multis_switch_handling(local_values)
+                    self.state_machine.multis_switch_handling(local_values)
+                    # Apply the switch if the state machine set a position
+                    if 'multis_switch_position' in local_values:
+                        self.set_multis_switch_mode(switch_position=local_values['multis_switch_position'])
                 except Exception as e:
                     self.logger.exception('Unhandled Exception!')
                     raise
@@ -215,70 +236,9 @@ class essBATT_controller:
 ###############################################################################################################################################################################################################################
 ###############################################################################################################################################################################################################################
     
-    def multis_switch_handling(self, local_values):
-        highest_priority_switch_val = 3
-        current_time = datetime.now(tz=None)
-        # if the current charge limit is zero than we do not need the charger
-        if(local_values['charge_current_limit_final'] <= 0.00001):
-            #deactivate charger (inverter only)
-            highest_priority_switch_val = 2
-            self.logger.debug('DEACTIVATE charger because of charge limit final being 0.')
-        if(local_values['discharge_power_limit_final'] <= (local_values['solarcharger_power_sum'] * 1.2)):
-            #deactivate inverter (charger only)
-            # If no charger limitation exists just switch off the inverter
-            if(highest_priority_switch_val == 3):
-                highest_priority_switch_val = 1
-                self.logger.debug('DEACTIVATE inverter because discharge power limit is below solarcharger power sum + 20%: ' + str((local_values['solarcharger_power_sum'] * 1.2)))
-            # if we already have a charger limitation and now additionally an inverter limitation switch off both
-            elif(highest_priority_switch_val == 2):
-                highest_priority_switch_val = 4
-                self.logger.debug('DEACTIVATE inverter AND charger because of charge- and discharge limit final being 0.')
-            else:
-                self.logger.error('Should not occur!')
-        
-        # Now we check if we are in minimum SOC condition for some time - this is indicated by discharge_current_limit_regular which only looks at SOC or min cell voltage (empty cell indicators)
-        # Set the debounce timer if we encounter a "low SOC event"      
-        if(local_values['discharge_current_limit_regular'] <= 0.0001 and self.temporary_script_states['multi_switch_min_soc_debounce_time'] is None):
-            self.temporary_script_states['multi_switch_min_soc_debounce_time'] = current_time
-            self.logger.debug('Low SOC event debounce timer set!')
-            #highest_priority_switch_val = 4
-        # If the discharge current limit does not indicate a "low SOC event" anymore reset the timer
-        if(local_values['discharge_current_limit_regular'] > 0.0001 and self.temporary_script_states['multi_switch_min_soc_debounce_time'] is not None):
-            self.temporary_script_states['multi_switch_min_soc_debounce_time'] = None
-            self.logger.debug('Low SOC event debounce timer reset!')
-        # If the discharge current limit does indicate a "low SOC event" and the timer was already set, check if the difference time passes a threshold
-        if(local_values['discharge_current_limit_regular'] <= 0.0001 and self.temporary_script_states['multi_switch_min_soc_debounce_time'] is not None):
-            diff_time = current_time - self.temporary_script_states['multi_switch_min_soc_debounce_time']
-            self.logger.debug('Low SOC event debounce timer difference (threshold 300): ' + str(diff_time.total_seconds()))
-            # Using hardcoded debounce time
-            if(diff_time.total_seconds() > 300):
-                # if we have detected a steady "low SOC event" we want to switch off inverter and charger
-                highest_priority_switch_val = 4
-                self.logger.debug('Stable low SOC after debounce time detected!')
-        
-        # Now we check if we have a winter limitation
-        if('winter_mode' in self.ess_controller_state and self.ess_controller_state['winter_mode'] == 'activated'):
-            if('winter_SOC_discharge_limit' in self.ess_controller_state and self.ess_controller_state['winter_SOC_discharge_limit'] == "activated"):
-                highest_priority_switch_val = 4
-                self.logger.debug('Winter mode inverter and charger switch off done!')
-                
-        #################################################################################################
-        # In some operating states it might be necessary to activate the charger/inverter. This handling is as follows:
-        # Note: Priority of charge to SOC or balancing is higher than settings from normal operation (like winter mode)
-        if(self.ess_controller_state['current_state'] == 'charge_to_SOC'):
-            #now we need to determine if its charging or discharging to switch on either charger or inverter
-            if(self.ess_controller_state['charge_to_SOC']['requested_current_direction'] == 'discharge'):
-                highest_priority_switch_val = 3 # Wanted to put value 2 (inverter only) but it did not work and was fixed to only 30W of discharge - for now it needs to stay on value 'on' to work. TODO: low priority problem
-                self.logger.debug('Inverter only multis switch setting due to "charge to SOC state" discharging.')
-            elif(self.ess_controller_state['charge_to_SOC']['requested_current_direction'] == 'charge'):
-                highest_priority_switch_val = 1
-                self.logger.debug('Charger only multis switch setting due to "charge to SOC state" charging.')
-        if(self.ess_controller_state['current_state'] == 'balancing'):
-            highest_priority_switch_val = 1
-            self.logger.debug('Charger only multis switch setting due to "balancing state" charging.')
-        
-        # Finally set the value in CCGX to a different value
-        self.set_multis_switch_mode(switch_position=highest_priority_switch_val)
+    # multis_switch_handling has been moved into StateMachine (Step 4).
+    # The controller now calls self.state_machine.multis_switch_handling(local_values)
+    # and applies the result if a position was set.
      
     def cleanup_after_control_loop(self):
         # Compare in-memory state only; avoids reading ess_controller_state from disk every control cycle
@@ -288,437 +248,12 @@ class essBATT_controller:
             )
             self._ess_controller_state_snapshot = copy.deepcopy(self.ess_controller_state)
             
-    def statemachine_update(self, local_values):
-        #### First check the external input ############################################################
-        if(self.ess_config_data['external_control_settings']['allow_external_control_over_mqtt'] == 1):
-            # First we need to find out if there was an update of the input data since the last statemachine update
-            latest_external_input_timestamp_obj = None
-            target_state = "none"
-            if((('balancing' in self.ess_external_input) and ('receive_time' in self.ess_external_input['balancing'])) and (('charge_to_SOC' in self.ess_external_input) and ('receive_time' in self.ess_external_input['charge_to_SOC']))):
-                if(self.ess_external_input['balancing']['receive_time'] > self.ess_external_input['charge_to_SOC']['receive_time']):
-                    latest_external_input_timestamp_obj = self.ess_external_input['balancing']['receive_time']
-                    target_state = "balancing"
-                else:
-                    latest_external_input_timestamp_obj = self.ess_external_input['charge_to_SOC']['receive_time']
-                    target_state = "charge_to_SOC"
-            elif(('charge_to_SOC' in self.ess_external_input) and ('receive_time' in self.ess_external_input['charge_to_SOC'])):
-                latest_external_input_timestamp_obj = self.ess_external_input['charge_to_SOC']['receive_time']
-                target_state = "charge_to_SOC"
-            elif(('balancing' in self.ess_external_input) and ('receive_time' in self.ess_external_input['balancing'])):
-                latest_external_input_timestamp_obj = self.ess_external_input['balancing']['receive_time']
-                target_state = "balancing"
-            else:
-                self.logger.debug('Checked external input: Neither "balancing" nor "charge_to_SOC" external command received yet. No state changes required.')
-            # If at least one command was received
-            if(latest_external_input_timestamp_obj is not None):
-                if(self.ess_external_input.get('new_data_received') is True):
-                    self.copy_external_data_to_internal_state_dict(target_state, local_values)
-            #### Now check state changes due to scheduled events from external starttimes  #####################################################
-            current_time_obj = datetime.now(tz=None)
-            # Case: Immediate state changes because no scheduled charge time is set
-            if('external_receive_info' in local_values):
-                # Switch on
-                target_state_str = local_values['external_receive_info']['target_state']
-                if(     ('activated' in local_values['external_receive_info']) and
-                        (local_values['external_receive_info']['activated'] is True) and
-                        (self.ess_controller_state[target_state_str]['activation_time'] == 'none') and 
-                        (self.ess_controller_state[target_state_str]['scheduled_start_time'] == 'none')):
-                    self.do_state_update(target_state_str)
-                # Switch off
-                if(('activated' in local_values['external_receive_info']) and (local_values['external_receive_info']['activated'] is False)):
-                    self.do_state_update('normal_operation')
-            
-            # Case: Checking if scheduled time is passed to switch to the new state   
-            target_state_list = ['balancing', 'charge_to_SOC']
-            for target_state_str in target_state_list:             
-                if( (self.ess_controller_state[target_state_str]['activation_time'] == 'none') and
-                    (self.ess_controller_state[target_state_str]['scheduled_start_time'] != 'none')):
-                    scheduled_time_obj = self.get_scheduled_starttime_datetime_obj(target_state_str)
-                    if(scheduled_time_obj is not None):
-                        if(scheduled_time_obj > current_time_obj):
-                            self.logger.debug('Switch to "' + target_state_str + '" waiting for scheduled time: ' + self.ess_controller_state[target_state_str]['scheduled_start_time'])
-                        else:
-                            self.do_state_update(target_state_str)
-                            self.logger.info('Switching to "' + target_state_str + '" because scheduled time reached:' + self.ess_controller_state[target_state_str]['scheduled_start_time'])
-                    else:
-                        self.logger.error('scheduled_time_obj could not be created due to wrong formatted scheduled_start_time string in ess_controller_state!')
-                    
-        #### Now check state changes due to scheduled events in the configuration file #####################################################
-        # AUTO BALANCING #
-        # only evaluate if auto balancing is activated
-        if(self.ess_config_data['balancing_settings']['auto_balancing_settings']['activate_auto_balancing'] == 1):
-            if(self.ess_controller_state['current_state'] != 'balancing'):
-                if(self.ess_controller_state['winter_mode'] == 'activated' and self.ess_config_data['winter_mode']['use_winter_mode'] == 1):
-                    time_string = self.ess_config_data['winter_mode']['auto_balancing_settings']['weekday'] + ' ' + self.ess_config_data['winter_mode']['auto_balancing_settings']['time']
-                    target_weekday_str = self.ess_config_data['winter_mode']['auto_balancing_settings']['weekday']
-                    target_diff_days   = self.ess_config_data['winter_mode']['auto_balancing_settings']['days_to_next_autobalancing']
-                else:
-                    time_string = self.ess_config_data['balancing_settings']['auto_balancing_settings']['weekday'] + ' ' + self.ess_config_data['balancing_settings']['auto_balancing_settings']['time']
-                    target_weekday_str = self.ess_config_data['balancing_settings']['auto_balancing_settings']['weekday'] 
-                    target_diff_days   = self.ess_config_data['balancing_settings']['auto_balancing_settings']['days_to_next_autobalancing']
-                try:                   
-                    activate_time_obj = datetime.strptime(time_string, '%A %H:%M')
-                    current_time_obj = datetime.now(tz=None)
-                    target_time_passed = (current_time_obj.time() > activate_time_obj.time())
-                    if(self.ess_controller_state['time_of_last_completed_balancing'] != "none"):
-                        try:
-                            last_balance_time_obj = datetime.strptime(self.ess_controller_state['time_of_last_completed_balancing'], '%d-%b-%Y (%H:%M:%S.%f)')
-                            diff_time = current_time_obj - last_balance_time_obj
-                            nof_diff_days = round(diff_time.total_seconds() / (60*60*24))
-                            self.logger.debug('Checking autobalancing. Number of days since last balance: ' + str(nof_diff_days))
-                            self.logger.debug('Checking autobalancing. Target diff days: ' + str(target_diff_days) + ', Target weekday: ' + str(target_weekday_str) + ' with current weekday: ' + current_time_obj.strftime('%A') + ', target time passed: ' + str(target_time_passed))
-                            # Check if condition to activate the balancing is met
-                            if((nof_diff_days >= target_diff_days) and (current_time_obj.strftime('%A') == target_weekday_str) and target_time_passed):
-                                self.logger.info('Autobalancing condition met!')
-                                self.do_state_update('balancing') 
-                        except ValueError as e:
-                            self.logger.error('time_of_last_completed_balancing has wrong format (%d-%b-%Y (%H:%M:%S.%f)): ' + str(e))
-                    else:
-                        if((current_time_obj.strftime('%A') == target_weekday_str) and target_time_passed):
-                            self.logger.info('First activation autobalancing condition met!')
-                            self.do_state_update('balancing') 
-                except ValueError as e:
-                    self.logger.error('Auto balancing weekday/time invalid (expected %%A,%%H:%M): ' + str(e))
-        # WINTER MODE #
-        if(self.ess_config_data['winter_mode']['use_winter_mode'] == 1):
-            # First need to test some hypotheses to find the correct year for winter mode start and end date
-            current_time_obj = datetime.now(tz=None)
-            current_time_year_str = current_time_obj.strftime('%Y')
-            current_year = int(current_time_year_str)
-            next_year = current_year + 1
-            next_year_str = str(next_year)
-            try:
-                winter_mode_start_this_year_obj = datetime.strptime(self.ess_config_data['winter_mode']['winter_mode_start_date'] + current_time_year_str, '%d.%m.%Y')
-                winter_mode_end_this_year_obj   = datetime.strptime(self.ess_config_data['winter_mode']['winter_mode_end_date'] + current_time_year_str, '%d.%m.%Y')
-                winter_mode_end_next_year_obj   = datetime.strptime(self.ess_config_data['winter_mode']['winter_mode_end_date'] + next_year_str, '%d.%m.%Y')
-            except ValueError as e:
-                self.logger.error('Winter mode start/end dates invalid in ess_config.json (use e.g. 12.03.): ' + str(e))
-                return
-            final_start_obj = winter_mode_start_this_year_obj
-            # if winter end is after winter start the order is ok and nothing needs to be adapted
-            if(winter_mode_end_this_year_obj > winter_mode_start_this_year_obj):
-                final_end_obj = winter_mode_end_this_year_obj
-            # if winter end is before winter start we need to distinguish: either it is still winter and the transition to summer shall not take place yet, then the end date is still this year
-            # but if we already are after the winter end then the end date is next year....argh....this code made me headache. But should work now :-)
-            elif((winter_mode_end_this_year_obj < winter_mode_start_this_year_obj) and (current_time_obj < winter_mode_end_this_year_obj)):
-                final_end_obj = winter_mode_end_this_year_obj
-            elif((winter_mode_end_this_year_obj < winter_mode_start_this_year_obj) and (current_time_obj > winter_mode_end_this_year_obj)):
-                final_end_obj = winter_mode_end_next_year_obj
-            else:
-                self.logger.error('Should not occur. Something is wrong with the winter mode time code.')
-            # After start and end date are evaluated we can check the switch conditions
-            if((current_time_obj < final_start_obj) and (final_start_obj < final_end_obj)):
-                # Only change if a change is necessary
-                if(self.ess_controller_state['winter_mode'] != 'not_activated'):
-                    self.logger.info('Winter is gone. Go into summer mode!')
-                    self.ess_controller_state['winter_mode'] = 'not_activated'
-                    self.reset_winter_mode_states()
-            elif((current_time_obj > final_start_obj) and (current_time_obj < final_end_obj)):
-                # Only change if a change is necessary
-                if(self.ess_controller_state['winter_mode'] != 'activated'):
-                    self.logger.info('Winter is coming! Go into winter mode!')
-                    self.ess_controller_state['winter_mode'] = 'activated'
-            elif((final_start_obj > final_end_obj) and (current_time_obj < final_end_obj)):
-                # Only change if a change is necessary
-                if(self.ess_controller_state['winter_mode'] != 'activated'):
-                    self.logger.info('Winter is coming! Go into winter mode!')
-                    self.ess_controller_state['winter_mode'] = 'activated'
-            elif((current_time_obj > final_start_obj) and (final_start_obj < final_end_obj)):
-                # Only change if a change is necessary
-                if(self.ess_controller_state['winter_mode'] != 'not_activated'):
-                    self.logger.info('Winter is gone. Go into summer mode!')
-                    self.ess_controller_state['winter_mode'] = 'not_activated'
-                    self.reset_winter_mode_states()
-            else:         
-                self.logger.error('Should not occur. Another thing is wrong with the winter/summer decision.')
-                self.logger.error('current_time_obj: ' + str(current_time_obj) + ', final_start_obj: ' + str(final_start_obj) + ', final_end_obj: ' + str(final_end_obj))
-                
-            # Now check the mode SOC condition and set state accordingly
-            if('battery_soc' in local_values):
-                if(     self.ess_controller_state['winter_mode'] == 'activated' 
-                   and  ((local_values['battery_soc'] <= self.ess_config_data['winter_mode']['winter_min_SOC'] and  self.ess_controller_state['winter_SOC_discharge_limit'] == "not_activated") # "normal" condition for winter_SOC_discharge_limit activation
-                   or    (self.ess_controller_state['winter_SOC_discharge_limit'] == "activated" and self.temporary_script_states['winter_mode_multis_switch_off_time'] is None))): # condition if a skript restart occurs and we need to recover the temporary state
-                    self.ess_controller_state['winter_SOC_discharge_limit'] = "activated"
-                    self.temporary_script_states['winter_mode_multis_switch_off_time'] = datetime.now(tz=None)
-                    self.logger.info('Winter SOC discharge limit ACTIVATED because its winter and SOC is/was equal or below ' + str(self.ess_config_data['winter_mode']['winter_min_SOC']))
-                if(self.ess_controller_state['winter_mode'] == 'activated' and local_values['battery_soc'] >= self.ess_config_data['winter_mode']['winter_restart_multis_SOC'] and self.ess_controller_state['winter_SOC_discharge_limit'] == "activated"):
-                    self.ess_controller_state['winter_SOC_discharge_limit'] = "not_activated"
-                    self.temporary_script_states['winter_mode_multis_switch_off_time'] = None
-                    self.logger.info('Winter SOC discharge limit DEACTIVATED because its winter and SOC is equal/above ' + str(self.ess_config_data['winter_mode']['winter_restart_multis_SOC']))
-            
-            
-            # Now check if charging due to low cell voltage in winter mode is required to protect the cells
-            if(self.temporary_script_states['winter_mode_multis_switch_off_time'] is not None and local_values['all_CCGX_values_available'] and self.ess_config_data['winter_mode']['winter_inactive_charge_min_voltage'] != "none"):
-                # if multis are already switched off due to winter mode for more than 10 Minutes (settling time hardcoded)
-                # and the min cell voltage is equal/below the configured threshold
-                diff_time_multis_switch_off_obj = current_time_obj - self.temporary_script_states['winter_mode_multis_switch_off_time']
-                if(local_values['battery_min_cell_voltage'] <= self.ess_config_data['winter_mode']['winter_inactive_charge_min_voltage'] 
-                   and self.temporary_script_states['winter_mode_inactive_charge_begin_time'] is None 
-                   and diff_time_multis_switch_off_obj.total_seconds() > 600):
-                    self.temporary_script_states['winter_mode_inactive_charge_begin_time'] = current_time_obj
-                    self.activate_charge_to_SOC_from_script(target_soc = 80, max_current = 20, current_direction='charge')
-                    self.logger.info('"STARTING" charging due to "WINTER MODE INACTIVE CHARGE" begin. Minimum cell voltage: ' + str(local_values['battery_min_cell_voltage']))
-                # If the charging is ongoing check the condition to stop the charging
-                if(self.temporary_script_states['winter_mode_inactive_charge_begin_time'] is not None):
-                    diff_time_charge_started_obj = current_time_obj - self.temporary_script_states['winter_mode_inactive_charge_begin_time']
-                    if(diff_time_charge_started_obj.total_seconds() > (self.ess_config_data['winter_mode']['winter_inactive_charge_time_minutes'] * 60)):
-                        self.temporary_script_states['winter_mode_inactive_charge_begin_time'] = None
-                        self.do_state_update('normal_operation')
-                        self.logger.info('"ENDING" charging due to "WINTER MODE INACTIVE CHARGE" time minutes passed. Number of minutes passed: ' + str(diff_time_charge_started_obj.total_seconds()/60))
-               
-        elif(self.ess_config_data['winter_mode']['use_winter_mode'] == 0):
-            pass # do nothing - just checking wrong values
-        else:
-            self.logger.error('Wrong use_winter_mode value in ess_config.json!')
-        
-        ############## Emergency (dis)charge MODE #######################
-        if(self.ess_config_data['battery_settings']['emergency_(dis)charge']['use_emergency_(dis)charging'] == 1):
-            if(local_values['all_CCGX_values_available']):
-                current_time_obj = datetime.now(tz=None)
-                # CHARGING
-                if(local_values['battery_min_cell_voltage'] <= self.ess_config_data['battery_settings']['emergency_(dis)charge']['min_cell_voltage_for_emergency_charge']):
-                    # If the emergency charge condition is met and is not activated yet --> activate charging
-                    if(self.temporary_script_states['emergency_(dis)charge_begin_time'] is None):
-                        self.temporary_script_states['emergency_(dis)charge_begin_time'] = current_time_obj
-                        self.activate_charge_to_SOC_from_script(target_soc = 80, max_current = 10, current_direction='charge')
-                        self.logger.info('"STARTING" charging due to "EMERGENCY"!!! Minimum cell voltage: ' + str(local_values['battery_min_cell_voltage']))
-                # DISCHARGING
-                if(local_values['battery_max_cell_voltage'] >= self.ess_config_data['battery_settings']['emergency_(dis)charge']['max_cell_voltage_for_emergency_discharge']):
-                    # If the emergency discharge condition is met and is not activated yet --> activate discharging
-                    if(self.temporary_script_states['emergency_(dis)charge_begin_time'] is None):
-                        self.temporary_script_states['emergency_(dis)charge_begin_time'] = current_time_obj
-                        self.activate_charge_to_SOC_from_script(target_soc = 10, max_current = 10, current_direction='discharge')
-                        self.logger.info('"STARTING" discharging due to "EMERGENCY"!!! Maximum cell voltage: ' + str(local_values['battery_max_cell_voltage']))       
-                # FINISHED: If emergency (dis)charging is ongoing check the abort condition         
-                if(self.temporary_script_states['emergency_(dis)charge_begin_time'] is not None):
-                    diff_time_emergency_started = current_time_obj - self.temporary_script_states['emergency_(dis)charge_begin_time']
-                    if(diff_time_emergency_started.total_seconds() > (self.ess_config_data['battery_settings']['emergency_(dis)charge']['emergency_(dis)charge_duration_minutes']*60)):
-                        self.temporary_script_states['emergency_(dis)charge_begin_time'] = None
-                        self.do_state_update('normal_operation')
-                        self.logger.info('"ENDING" (dis)charging due to "EMERGENCY". Number of minutes passed: ' + str(diff_time_emergency_started.total_seconds()/60) + '. Max cell voltage: ' + str(local_values['battery_max_cell_voltage']) + '. Min cell voltage: ' + str(local_values['battery_min_cell_voltage']))
-                
-        #### Now check if the balancing or charge_to_SOC conditions are met so that the system can go back to normal state #################
-        if(local_values['all_CCGX_values_available']):
-            if(self.ess_controller_state['current_state'] == 'balancing'):
-                # If the min cell voltage is above the defined threshold and if min and max cell voltage are within a defined limit
-                if((local_values['battery_min_cell_voltage'] >= self.ess_config_data['balancing_settings']['balancing_complete_condition']['min_cell_voltage_threshold'])
-                    and (abs(local_values['battery_min_cell_voltage'] - local_values['battery_max_cell_voltage']) < self.ess_config_data['balancing_settings']['balancing_complete_condition']['max_diff_voltage_between_min_and_max_cell'])):
-                    self.logger.info('Balancing complete condition met! Switching to normal operation. min_cell_voltage_threshold: ' + str(self.ess_config_data['balancing_settings']['balancing_complete_condition']['min_cell_voltage_threshold']) + ' und max_diff_voltage_between_min_and_max_cell: ' + str(self.ess_config_data['balancing_settings']['balancing_complete_condition']['max_diff_voltage_between_min_and_max_cell']))
-                    self.do_state_update('normal_operation')
-                    self.ess_controller_state['time_of_last_completed_balancing'] = datetime.now(tz=None).strftime("%d-%b-%Y (%H:%M:%S.%f)")                   
-            elif((self.ess_controller_state['current_state'] == 'charge_to_SOC') and (self.ess_controller_state['charge_to_SOC']['requested_current_direction'] != 'none')):
-                if(self.ess_controller_state['charge_to_SOC']['requested_current_direction'] == 'discharge'):
-                    if(local_values['battery_soc'] <= self.ess_controller_state['charge_to_SOC']['target_SOC']):
-                        self.logger.info('Charge to SOC completed! Switching to normal operation. Current direction: ' + self.ess_controller_state['charge_to_SOC']['requested_current_direction'] + ', battery SOC: ' + str(local_values['battery_soc']) + ', target SOC: ' + str(self.ess_controller_state['charge_to_SOC']['target_SOC']))
-                        self.do_state_update('normal_operation')
-                elif(self.ess_controller_state['charge_to_SOC']['requested_current_direction'] == 'charge'):
-                    if(local_values['battery_soc'] >= self.ess_controller_state['charge_to_SOC']['target_SOC']):
-                        self.logger.info('Charge to SOC completed! Switching to normal operation. Current direction: ' + self.ess_controller_state['charge_to_SOC']['requested_current_direction'] + ', battery SOC: ' + str(local_values['battery_soc']) + ', target SOC: ' + str(self.ess_controller_state['charge_to_SOC']['target_SOC']))
-                        self.do_state_update('normal_operation')                       
-                elif(self.ess_controller_state['charge_to_SOC']['requested_current_direction'] == 'SOC_reached'):
-                    self.logger.info('Charge to SOC completed! Switching to normal operation. Current direction: ' + self.ess_controller_state['charge_to_SOC']['requested_current_direction'] + ', battery SOC: ' + str(local_values['battery_soc']) + ', target SOC: ' + str(self.ess_controller_state['charge_to_SOC']['target_SOC']))
-                    self.do_state_update('normal_operation')                   
-                else:
-                    self.logger.error('requested_current_direction has unknown state: ' + self.ess_controller_state['charge_to_SOC']['requested_current_direction'])
-            elif(self.ess_controller_state['current_state'] == 'normal_operation'):
-                # No actions required - just here to check for unknown states 
-                pass
-            else:
-                self.logger.error('Unknown string in "current_state": ' + self.ess_controller_state['current_state'])
-                
-    def activate_charge_to_SOC_from_script(self, target_soc, max_current="none", current_direction='charge'):
-        """
-        This function activates the charging/discharging immediately and has no scheduled start time functionality.
-        """
-        # Clipping to min and max values
-        if(target_soc > 99.9):
-            target_soc = 99.9
-            self.logger.debug('Charge to SOC target SOC limited to 99.9')
-        if(target_soc < 0.1):
-            target_soc = 0.1
-            self.logger.debug('Charge to SOC target SOC limited to 0.1')
-        self.ess_controller_state['charge_to_SOC']['target_SOC'] = target_soc
-        self.ess_controller_state['charge_to_SOC']['max_current'] = max_current
-        self.ess_controller_state['charge_to_SOC']['requested_current_direction'] = current_direction
-        self.do_state_update('charge_to_SOC')
-        
-    def reset_winter_mode_states(self):
-        self.temporary_script_states['winter_mode_multis_switch_off_time'] = None
-        self.temporary_script_states['winter_mode_inactive_charge_begin_time'] = None
-        self.temporary_script_states['winter_mode_charge_begin_time'] = None
-        
-    def get_scheduled_starttime_datetime_obj(self, mode_string):
-        format_string = self.ess_config_data['external_control_settings']['date_format'] + ' ' + self.ess_config_data['external_control_settings']['time_format']
-        try:
-            ret_val = datetime.strptime(self.ess_controller_state[mode_string]['scheduled_start_time'], format_string)
-        except ValueError:
-            ret_val = None
-        return ret_val
-       
-    def do_state_update(self, target_state_str):
-        now_string = datetime.now(tz=None).strftime("%d-%b-%Y (%H:%M:%S.%f)")
-        self.logger.info('State change from ' + self.ess_controller_state['current_state'] + ' to "' + target_state_str.upper() + '"!')
-        self.ess_controller_state['current_state'] = target_state_str
-        self.ess_controller_state['time_of_last_change'] = now_string
-        if((target_state_str == 'balancing') or (target_state_str == 'charge_to_SOC')):
-            self.ess_controller_state[target_state_str]['activation_time'] = now_string
-        if(target_state_str == 'normal_operation'):
-            self.reset_single_state_data('balancing')
-            self.reset_single_state_data('charge_to_SOC')
-
-            
-    def copy_external_data_to_internal_state_dict(self, target_state_str, local_values):
-        local_values['external_receive_info'] = {}
-        # More complex handling when target state is balancing or charge_to_SOC...
-        if((target_state_str == "balancing") or (target_state_str == "charge_to_SOC")):
-            # A state change should only be performed if the new state is different to the current state
-            # or if a state was switched off (which brings it automatically to state "normal_operation")
-            # First: different state
-            #if(self.ess_controller_state['current_state'] != target_state_str):
-            if((target_state_str == "balancing") and (self.ess_external_input['balancing']['activated'] == '1')):
-                # When receiving a new activation command the other state data is profilactically deleted
-                self.reset_single_state_data('charge_to_SOC')
-                if('current_limit_input' in self.ess_external_input['balancing']):
-                    self.ess_controller_state['balancing']['max_current'] = self.ess_external_input['balancing']['current_limit_input']
-                self.update_state_scheduledtime_from_external_input(target_state_str)
-                local_values['external_receive_info']['target_state'] = target_state_str
-                local_values['external_receive_info']['activated'] = True
-                self.ess_external_input['new_data_received'] = False
-                # After everything is read and copy we need to flush the external input data
-                self.ess_external_input['balancing'] = {}
-                self.logger.debug('Copied balancing external input data to ess controller state because of switch on command.')
-            elif((target_state_str == "charge_to_SOC") and (self.ess_external_input['charge_to_SOC']['activated'] == '1')):
-                # When receiving a new activation command the other state data is profilactically deleted
-                #TODO Send switch off command to balancing topic to switch it off on sender site
-                self.reset_single_state_data('balancing')
-                # First evaluate if the goal is to discharge or to charge
-                if('target_SOC' in self.ess_external_input['charge_to_SOC']):
-                    if('battery_soc' not in local_values):
-                        self.logger.warning('charge_to_SOC command ignored: battery SOC not available yet.')
-                        return
-                    if(self.ess_external_input['charge_to_SOC']['target_SOC'] > local_values['battery_soc']):
-                        self.ess_controller_state['charge_to_SOC']['requested_current_direction'] = 'charge'
-                    elif(self.ess_external_input['charge_to_SOC']['target_SOC'] == local_values['battery_soc']):
-                        self.ess_controller_state['charge_to_SOC']['requested_current_direction'] = 'SOC_reached'
-                        self.logger.info('Target SOC for charge_to_SOC already "REACHED"!')
-                    else:
-                        self.ess_controller_state['charge_to_SOC']['requested_current_direction'] = 'discharge'
-                else:
-                    self.logger.error('target_SOC was not in self.ess_external_input["charge_to_SOC"] but is mandatory for this command!')
-                self.logger.debug('(Dis-)charge? --> ' + self.ess_controller_state['charge_to_SOC']['requested_current_direction'])
-                # Now set the rest of the values
-                if('target_SOC' in self.ess_external_input['charge_to_SOC']):
-                    # Clipping to min and max values
-                    if(self.ess_external_input['charge_to_SOC']['target_SOC'] > 99.9):
-                        self.ess_controller_state['charge_to_SOC']['target_SOC'] = 99.9
-                        self.logger.debug('Charge to SOC target SOC limited to 99.9')
-                    elif(self.ess_external_input['charge_to_SOC']['target_SOC'] < 0.1):
-                        self.ess_controller_state['charge_to_SOC']['target_SOC'] = 0.1
-                        self.logger.debug('Charge to SOC target SOC limited to 0.1')
-                    else:
-                        self.ess_controller_state['charge_to_SOC']['target_SOC'] = self.ess_external_input['charge_to_SOC']['target_SOC']
-                if('current_limit_input' in self.ess_external_input['charge_to_SOC']):
-                    self.ess_controller_state['charge_to_SOC']['max_current'] = self.ess_external_input['charge_to_SOC']['current_limit_input']
-                self.update_state_scheduledtime_from_external_input(target_state_str)
-                local_values['external_receive_info']['target_state'] = target_state_str
-                local_values['external_receive_info']['activated'] = True
-                self.ess_external_input['new_data_received'] = False
-                # After everything is read and copy we need to flush the external input data
-                self.ess_external_input['charge_to_SOC'] = {}
-                self.logger.debug('Copied charge_to_SOC external input data to ess controller state because of switch on command.')
-            # Second: same state but switched off
-            #else:
-            elif((target_state_str == "balancing") and (self.ess_external_input['balancing']['activated'] == '0')):
-                self.reset_single_state_data('balancing')
-                self.logger.info('Balancing switch off command registered!')
-                local_values['external_receive_info']['target_state'] = target_state_str
-                local_values['external_receive_info']['activated'] = False
-                self.ess_external_input['new_data_received'] = False
-                # After everything is read and copy we need to flush the external input data
-                self.ess_external_input['balancing'] = {}
-
-            elif((target_state_str == "charge_to_SOC") and (self.ess_external_input['charge_to_SOC']['activated'] == '0')):
-                self.reset_single_state_data('charge_to_SOC')
-                self.logger.info('Charge to SOC switch off command registered!')
-                local_values['external_receive_info']['target_state'] = target_state_str
-                local_values['external_receive_info']['activated'] = False
-                self.ess_external_input['new_data_received'] = False
-                # After everything is read and copy we need to flush the external input data
-                self.ess_external_input['charge_to_SOC'] = {}
-            else:
-                self.logger.error('Unknown state: ' + target_state_str)
-                return
-     
-    
-    def update_state_scheduledtime_from_external_input(self, mode_string):
-        if('date_input' not in self.ess_external_input[mode_string]):
-            date_input_local = '-'
-        else:
-            date_input_local = self.ess_external_input[mode_string]['date_input']
-        if('time_input' not in self.ess_external_input[mode_string]):
-            time_input_local = '-'
-        else:
-            time_input_local = self.ess_external_input[mode_string]['time_input']
-        scheduled_start_time = self.datetime_obj_from_input_timestamp(time_input_local, date_input_local)
-        # If the return value scheduled_start_time is not a number (datetime_obj_from_input_timestamp() returns -1 if no starttime can be set)
-        if((not isinstance(scheduled_start_time, numbers.Number)) and (scheduled_start_time is not None)):
-            format_string = self.ess_config_data['external_control_settings']['date_format'] + ' ' + self.ess_config_data['external_control_settings']['time_format']
-            self.ess_controller_state[mode_string]['scheduled_start_time'] = scheduled_start_time.strftime(format_string)
-        else:
-            self.ess_controller_state[mode_string]['scheduled_start_time'] = 'none'
-        self.logger.debug('Updated ' + mode_string + 'scheduled start time to ' + self.ess_controller_state[mode_string]['scheduled_start_time']) 
-                
-    def reset_single_state_data(self, reset_state):
-        # Update the potentially changed settings in all cases
-        if(reset_state == "balancing"):
-            self.ess_controller_state['balancing']['activation_time'] = 'none'
-            self.ess_controller_state['balancing']['max_current'] = 'none'
-            self.ess_controller_state['balancing']['scheduled_start_time'] = 'none'
-            self.logger.debug('Reset state: ' + reset_state)
-        elif(reset_state == "charge_to_SOC"):
-            self.ess_controller_state['charge_to_SOC']['activation_time'] = 'none'
-            self.ess_controller_state['charge_to_SOC']['target_SOC'] = 'none'
-            self.ess_controller_state['charge_to_SOC']['max_current'] = 'none'
-            self.ess_controller_state['charge_to_SOC']['scheduled_start_time'] = 'none'
-            self.ess_controller_state['charge_to_SOC']['requested_current_direction'] = 'none'
-            self.logger.debug('Reset state: ' + reset_state)
-        else:
-            self.logger.error('Unknown state: ' + reset_state)
-            
-    def datetime_obj_from_input_timestamp(self, timestring, datestring):
-        # Dealing with the case, that no value is given
-        
-        if((timestring == "-") and (datestring == "-")):
-            self.logger.debug('Datetime object creator was called without a valid timestring. So nothing.')
-            return
-        # Default case for time is the beginning of the day
-        if(timestring == "-"):
-            timestring = "00:00"
-            self.logger.debug('Using default time 00:00 for datetime object because only date was given.')
-        # Default case for date is the date of today or (if this time is in the past then take the date of tomorrow)
-        if(datestring == "-"):
-            date_obj_now = datetime.now(tz=None)
-            datestring_today = date_obj_now.strftime(self.ess_config_data['external_control_settings']['date_format'])           
-            format_string = self.ess_config_data['external_control_settings']['date_format'] + ' ' + self.ess_config_data['external_control_settings']['time_format']
-            temp_combined_datetime_str = datestring_today + ' '  + timestring
-            temp_test_obj = datetime.strptime(temp_combined_datetime_str, format_string)  
-            # Selection on the datestring based on the resulting timestamp being in the past or not
-            if(temp_test_obj < date_obj_now):
-                timedelta_obj = timedelta(days=1)
-                datestring = (datetime.now(tz=None) + timedelta_obj).strftime(self.ess_config_data['external_control_settings']['date_format'])
-                self.logger.debug('Only time was given. Assuming date of "TOMORROW" because time today already passed.')
-            else:
-                datestring = datestring_today
-                self.logger.debug('Only time was given. Assuming date of today to create datetime object.')
-        
-        combined_datetime_str = datestring + ' ' + timestring
-        format_string = self.ess_config_data['external_control_settings']['date_format'] + ' ' + self.ess_config_data['external_control_settings']['time_format']
-        try:
-            temp_obj = datetime.strptime(combined_datetime_str, format_string)
-            return temp_obj
-        except ValueError as e:
-            self.logger.error('Datetime object could not be created from "' + combined_datetime_str + '": ' + str(e))
-            return -1
+    # All state machine logic has been moved to StateMachine (Step 4).
+    # See state_machine.py. The controller now calls:
+    #   self.state_machine.update(local_values)
+    #
+    # Old methods (statemachine_update, do_state_update, activate_..., reset_*, etc.)
+    # have been removed from this file.
     
             
     def create_subscribtion_list(self, base_path_str):

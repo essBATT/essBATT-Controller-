@@ -36,14 +36,36 @@ def sample_config():
             "max_cell_voltage_charging_resume": 3.5,
             "soc_based_charge_limit_soc_array": [80, 90, 95],
             "soc_based_charge_limit_current_array": [25, 10, 5],
-            # ... (more can be added per test)
             "discharge_limit_mode": "soc_and_min_cell",
             "min_cell_voltage_discharging": 3.1,
             "min_cell_voltage_discharging_resume": 3.25,
+            "emergency_(dis)charge": {
+                "use_emergency_(dis)charging": 0,
+                "min_cell_voltage_for_emergency_charge": 2.8,
+                "max_cell_voltage_for_emergency_discharge": 3.6,
+                "emergency_(dis)charge_duration_minutes": 10,
+            },
         },
-        "balancing_settings": {"auto_balancing_settings": {"activate_auto_balancing": 0}},
-        "winter_mode": {"use_winter_mode": 0},
-        "external_control_settings": {"allow_external_control_over_mqtt": 0},
+        "balancing_settings": {
+            "auto_balancing_settings": {"activate_auto_balancing": 0},
+            "balancing_complete_condition": {
+                "min_cell_voltage_threshold": 3.4,
+                "max_diff_voltage_between_min_and_max_cell": 0.05,
+            },
+        },
+        "winter_mode": {
+            "use_winter_mode": 0,
+            "winter_min_SOC": 25,
+            "winter_restart_multis_SOC": 30,
+            "winter_mode_start_date": "01.11.",
+            "winter_mode_end_date": "01.03.",
+            "auto_balancing_settings": {"activate_auto_balancing": 0, "weekday": "Sunday", "time": "03:00", "days_to_next_autobalancing": 7},
+        },
+        "external_control_settings": {
+            "allow_external_control_over_mqtt": 0,
+            "date_format": "%d.%m.%Y",
+            "time_format": "%H:%M",
+        },
     }
 
 
