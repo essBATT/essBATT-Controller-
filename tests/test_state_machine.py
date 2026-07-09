@@ -381,6 +381,70 @@ def test_winter_mode_deactivates_on_high_soc(state_machine, sample_controller_st
     assert sample_controller_state["winter_SOC_discharge_limit"] == "not_activated"
 
 
+def test_winter_inactive_charge_starts_after_debounce(
+    state_machine, sample_controller_state, sample_config, sample_temporary_states
+):
+    """After Multis off long enough and min cell low, winter inactive charge starts."""
+    sample_config["winter_mode"]["use_winter_mode"] = 1
+    today = datetime.now(tz=None)
+    sample_config["winter_mode"]["winter_mode_start_date"] = (today - timedelta(days=1)).strftime("%d.%m.")
+    sample_config["winter_mode"]["winter_mode_end_date"] = (today + timedelta(days=1)).strftime("%d.%m.")
+    sample_config["winter_mode"]["winter_inactive_charge_min_voltage"] = 3.17
+    sample_config["winter_mode"]["winter_inactive_charge_time_minutes"] = 30
+    sample_config["winter_mode"]["winter_min_SOC"] = 25
+    sample_config["winter_mode"]["winter_restart_multis_SOC"] = 70
+
+    sample_controller_state["winter_mode"] = "activated"
+    sample_controller_state["winter_SOC_discharge_limit"] = "activated"
+    # Multis have been off for > 10 minutes
+    sample_temporary_states["winter_mode_multis_switch_off_time"] = today - timedelta(minutes=15)
+    sample_temporary_states["winter_mode_inactive_charge_begin_time"] = None
+
+    local = {
+        "battery_soc": 20,
+        "all_CCGX_values_available": True,
+        "battery_min_cell_voltage": 3.15,
+        "battery_max_cell_voltage": 3.30,
+    }
+    state_machine._handle_winter_mode(local)
+
+    assert sample_controller_state["current_state"] == "charge_to_SOC"
+    assert sample_controller_state["charge_to_SOC"]["target_SOC"] == 80
+    assert sample_controller_state["charge_to_SOC"]["max_current"] == 20
+    assert sample_temporary_states["winter_mode_inactive_charge_begin_time"] is not None
+
+
+def test_winter_inactive_charge_ends_after_duration(
+    state_machine, sample_controller_state, sample_config, sample_temporary_states
+):
+    """Winter inactive charge returns to normal after configured duration."""
+    sample_config["winter_mode"]["use_winter_mode"] = 1
+    today = datetime.now(tz=None)
+    sample_config["winter_mode"]["winter_mode_start_date"] = (today - timedelta(days=1)).strftime("%d.%m.")
+    sample_config["winter_mode"]["winter_mode_end_date"] = (today + timedelta(days=1)).strftime("%d.%m.")
+    sample_config["winter_mode"]["winter_inactive_charge_min_voltage"] = 3.17
+    sample_config["winter_mode"]["winter_inactive_charge_time_minutes"] = 0.01  # ~0.6s
+    sample_config["winter_mode"]["winter_min_SOC"] = 25
+    sample_config["winter_mode"]["winter_restart_multis_SOC"] = 70
+
+    sample_controller_state["winter_mode"] = "activated"
+    sample_controller_state["winter_SOC_discharge_limit"] = "activated"
+    sample_controller_state["current_state"] = "charge_to_SOC"
+    sample_temporary_states["winter_mode_multis_switch_off_time"] = today - timedelta(minutes=20)
+    sample_temporary_states["winter_mode_inactive_charge_begin_time"] = today - timedelta(seconds=2)
+
+    local = {
+        "battery_soc": 20,
+        "all_CCGX_values_available": True,
+        "battery_min_cell_voltage": 3.20,
+        "battery_max_cell_voltage": 3.30,
+    }
+    state_machine._handle_winter_mode(local)
+
+    assert sample_controller_state["current_state"] == "normal_operation"
+    assert sample_temporary_states["winter_mode_inactive_charge_begin_time"] is None
+
+
 def test_emergency_charge_starts_and_expires(state_machine, sample_controller_state, sample_temporary_states, sample_config):
     """Low min_cell starts emergency charge_to_SOC; after duration returns to normal."""
     sample_config["battery_settings"]["emergency_(dis)charge"]["use_emergency_(dis)charging"] = 1

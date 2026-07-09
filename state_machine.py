@@ -161,12 +161,23 @@ class StateMachine:
                 self.ess_controller_state['winter_mode'] = 'activated'
 
         if 'battery_soc' in local_values:
-            if (self.ess_controller_state['winter_mode'] == 'activated' and
-                    local_values['battery_soc'] <= self.config['winter_mode']['winter_min_SOC'] and
-                    self.ess_controller_state.get('winter_SOC_discharge_limit') != "activated"):
+            # Activate winter SOC discharge limit, or recover timer after script restart
+            winter_limit_active = self.ess_controller_state.get('winter_SOC_discharge_limit') == "activated"
+            need_activate = (
+                self.ess_controller_state['winter_mode'] == 'activated'
+                and local_values['battery_soc'] <= self.config['winter_mode']['winter_min_SOC']
+                and not winter_limit_active
+            )
+            need_recover_timer = (
+                winter_limit_active
+                and self.temporary_script_states.get('winter_mode_multis_switch_off_time') is None
+            )
+            if need_activate or need_recover_timer:
                 self.ess_controller_state['winter_SOC_discharge_limit'] = "activated"
                 self.temporary_script_states['winter_mode_multis_switch_off_time'] = now
-                self.logger.info(f'Winter SOC discharge limit ACTIVATED (<= {self.config["winter_mode"]["winter_min_SOC"]})')
+                self.logger.info(
+                    f'Winter SOC discharge limit ACTIVATED (<= {self.config["winter_mode"]["winter_min_SOC"]})'
+                )
 
             if (self.ess_controller_state['winter_mode'] == 'activated' and
                     local_values['battery_soc'] >= self.config['winter_mode']['winter_restart_multis_SOC'] and
@@ -174,6 +185,39 @@ class StateMachine:
                 self.ess_controller_state['winter_SOC_discharge_limit'] = "not_activated"
                 self.temporary_script_states['winter_mode_multis_switch_off_time'] = None
                 self.logger.info('Winter SOC discharge limit DEACTIVATED')
+
+        # Winter inactive charge: protect cells while Multis are off in winter low-SOC mode
+        inactive_min_v = self.config['winter_mode'].get('winter_inactive_charge_min_voltage', 'none')
+        if (self.temporary_script_states.get('winter_mode_multis_switch_off_time') is not None
+                and local_values.get('all_CCGX_values_available')
+                and inactive_min_v != 'none'
+                and inactive_min_v is not None):
+            diff_off = now - self.temporary_script_states['winter_mode_multis_switch_off_time']
+            # Settling time after Multis switch off (hardcoded 10 minutes, matches original)
+            if (local_values.get('battery_min_cell_voltage', 999) <= inactive_min_v
+                    and self.temporary_script_states.get('winter_mode_inactive_charge_begin_time') is None
+                    and diff_off.total_seconds() > 600):
+                self.temporary_script_states['winter_mode_inactive_charge_begin_time'] = now
+                self.activate_charge_to_SOC_from_script(
+                    target_soc=80, max_current=20, current_direction='charge'
+                )
+                self.logger.info(
+                    '"STARTING" charging due to "WINTER MODE INACTIVE CHARGE" begin. '
+                    'Minimum cell voltage: ' + str(local_values.get('battery_min_cell_voltage'))
+                )
+            begin_inactive = self.temporary_script_states.get('winter_mode_inactive_charge_begin_time')
+            if begin_inactive is not None:
+                charge_minutes = self.config['winter_mode'].get(
+                    'winter_inactive_charge_time_minutes', 30
+                )
+                if (now - begin_inactive).total_seconds() > charge_minutes * 60:
+                    self.temporary_script_states['winter_mode_inactive_charge_begin_time'] = None
+                    self.do_state_update('normal_operation')
+                    self.logger.info(
+                        '"ENDING" charging due to "WINTER MODE INACTIVE CHARGE" time minutes passed. '
+                        'Number of minutes passed: '
+                        + str((now - begin_inactive).total_seconds() / 60)
+                    )
 
     def _handle_emergency(self, local_values):
         if self.config['battery_settings']['emergency_(dis)charge']['use_emergency_(dis)charging'] != 1:
@@ -184,17 +228,19 @@ class StateMachine:
         now = datetime.now(tz=None)
         cfg = self.config['battery_settings']['emergency_(dis)charge']
 
-        if local_values.get('battery_min_cell_voltage') <= cfg['min_cell_voltage_for_emergency_charge']:
+        min_cell = local_values.get('battery_min_cell_voltage')
+        max_cell = local_values.get('battery_max_cell_voltage')
+        if min_cell is not None and min_cell <= cfg['min_cell_voltage_for_emergency_charge']:
             if self.temporary_script_states.get('emergency_(dis)charge_begin_time') is None:
                 self.temporary_script_states['emergency_(dis)charge_begin_time'] = now
                 self.activate_charge_to_SOC_from_script(80, 10, 'charge')
-                self.logger.info(f'"STARTING" emergency charging (min cell {local_values["battery_min_cell_voltage"]})')
+                self.logger.info(f'"STARTING" emergency charging (min cell {min_cell})')
 
-        if local_values.get('battery_max_cell_voltage') >= cfg['max_cell_voltage_for_emergency_discharge']:
+        if max_cell is not None and max_cell >= cfg['max_cell_voltage_for_emergency_discharge']:
             if self.temporary_script_states.get('emergency_(dis)charge_begin_time') is None:
                 self.temporary_script_states['emergency_(dis)charge_begin_time'] = now
                 self.activate_charge_to_SOC_from_script(10, 10, 'discharge')
-                self.logger.info(f'"STARTING" emergency discharging (max cell {local_values["battery_max_cell_voltage"]})')
+                self.logger.info(f'"STARTING" emergency discharging (max cell {max_cell})')
 
         begin = self.temporary_script_states.get('emergency_(dis)charge_begin_time')
         if begin:

@@ -82,11 +82,17 @@ class essBATT_controller:
         self.logger.setLevel(constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data.get('debug_level', 'INFO')])
         self.logger.info('Effective logger level: ' + str(self.logger.getEffectiveLevel()))
 
-        # Create temporary (non-persisted) script states early (used by StateMachine + BatteryProtector logic)
+        # Create temporary (non-persisted) script states early (shared by StateMachine + BatteryProtector)
         self.temporary_script_states = self.config_manager.create_temporary_script_states(self.ess_config_data)
 
-        # Step 3: BatteryProtector for all limit calculations
-        self.battery_protector = BatteryProtector(self.ess_config_data, self.logger)
+        # Step 3: BatteryProtector for all limit calculations (shares temp state + controller state)
+        self.battery_protector = BatteryProtector(
+            self.ess_config_data,
+            self.logger,
+            self.temporary_script_states,
+            self.ess_controller_state,
+            self.ess_external_input,
+        )
 
         # Step 4: StateMachine
         self.state_machine = StateMachine(
@@ -157,11 +163,8 @@ class essBATT_controller:
         # Only update if MQTT connection is active 
         if(self.mqtt_connection_ok is True):   
             # If feature is activated, read the ess_config.json file in each run - helpful if you try out different values while the script is running
-            if(self.ess_config_data['check_ess_config_changes_while_running'] == 1):
-                self.read_config_json()
-                # Some additional settings that otherwise would not change due to online changes (changes while script is running) in ess_config_json.
-                self.logger.setLevel(constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data['debug_level']])
-                self.rt_ess_control_update_obj.interval = self.ess_config_data['control_update_rate']
+            if(self.ess_config_data.get('check_ess_config_changes_while_running', 0) == 1):
+                self.reload_config_while_running()
 
             ############# Read data from Victron System ###################################
             # This is done with the MQTT callback functions. The "up to date" data is stored in self.CCGX_data dictionary. Data fields in self.CCGX_data
@@ -491,6 +494,23 @@ class essBATT_controller:
 
     # All config and state related methods have been moved to ConfigManager (Step 2).
     # See config_manager.py for load_config(), load_state(), save_state_if_changed(), etc.
+
+    def reload_config_while_running(self):
+        """Reload ess_config.json and propagate to dependent modules (online tuning)."""
+        new_config = self.config_manager.load_config()
+        if not self.config_manager.config_data_loaded_correctly:
+            self.logger.error('Online config reload failed; keeping previous config.')
+            return
+        self.ess_config_data = new_config
+        # Keep module config references in sync
+        self.battery_protector.update_config(new_config)
+        self.state_machine.config = new_config
+        self.logger.setLevel(
+            constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data.get('debug_level', 'INFO')]
+        )
+        if hasattr(self, 'rt_ess_control_update_obj') and self.rt_ess_control_update_obj is not None:
+            self.rt_ess_control_update_obj.interval = self.ess_config_data.get('control_update_rate', 2.0)
+        self.logger.debug('ess_config.json reloaded while running.')
     
     def add_topic_specific_callbacks(self, base_path_str):
         # Grid

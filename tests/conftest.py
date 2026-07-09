@@ -59,6 +59,8 @@ def sample_config():
             "winter_restart_multis_SOC": 30,
             "winter_mode_start_date": "01.11.",
             "winter_mode_end_date": "01.03.",
+            "winter_inactive_charge_min_voltage": 3.17,
+            "winter_inactive_charge_time_minutes": 30,
             "auto_balancing_settings": {"activate_auto_balancing": 0, "weekday": "Sunday", "time": "03:00", "days_to_next_autobalancing": 7},
         },
         "external_control_settings": {

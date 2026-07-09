@@ -106,17 +106,27 @@ class ConfigManager:
         return False
 
     def create_temporary_script_states(self, config_data):
-        """Create temporary (non-persisted) script states dictionary."""
+        """Create temporary (non-persisted) script states dictionary.
+
+        Shared by StateMachine and BatteryProtector (same object reference).
+        """
+        max_discharge = config_data.get('ess_mode_2_settings', {}).get(
+            'max_battery_discharge_current', constants.DEFAULT_MAX_BATTERY_DISCHARGE_CURRENT
+        )
+        max_charge = config_data.get('ess_mode_2_settings', {}).get(
+            'max_battery_charge_current_2705', constants.DEFAULT_MAX_BATTERY_CHARGE_CURRENT
+        )
         return {
             "multi_switch_min_soc_debounce_time": None,
             "winter_mode_multis_switch_off_time": None,
             "winter_mode_inactive_charge_begin_time": None,
             "emergency_(dis)charge_begin_time": None,
             "winter_mode_charge_begin_time": None,
-            "discharge_current_limit_state": config_data.get('ess_mode_2_settings', {}).get('max_battery_discharge_current', 5.0),
+            "discharge_current_limit_state": max_discharge,
             "discharge_current_limit_hit_zero": False,
-            "charge_current_limit_state": config_data.get('ess_mode_2_settings', {}).get('max_battery_charge_current_2705', 5.0),
-            "charge_current_limit_hit_zero": False
+            "charge_current_limit_state": max_charge,
+            "charge_current_limit_hit_zero": False,
+            "discharge_regular_current_limit_last_cycle": 0.0,
         }
 
     def save_state_if_changed(self, current_state, snapshot):
