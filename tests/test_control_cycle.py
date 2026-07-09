@@ -18,6 +18,22 @@ What this does *not* prove
 Real dbus-mqtt topic shapes, Cerbo keepalive behaviour, multi-device race
 conditions, or live Venus firmware quirks. Those need a lab system or
 recorded MQTT fixtures later.
+
+What it can catch (without home hardware)
+• Key contract bugs (battery_soc vs wrong names)
+• Cycle skips dynamic path when data incomplete
+• External deactivate flags actually clamp published limits
+• Protection results reach MQTT setpoints
+• Redundant publish suppression
+• State save on change
+
+What it cannot catch (needs lab / home later)
+• Real topic paths / payload quirks on a given Venus version
+• Device disappear/reappear on the bus
+• Keepalive timing with Cerbo
+• Multi/vebus edge cases on real hardware
+
+Optional later upgrade: recorded MQTT fixtures (capture a few minutes of topics at home, replay into ingestion). Still no live system in CI.
 """
 
 import copy
@@ -256,7 +272,6 @@ def cycle_controller():
         mock_client.publish.return_value = (0, 1)
         ctrl.victron_output.set_mqtt_client(mock_client)
         ctrl.mqtt_bridge.connection_ok = True
-        ctrl.mqtt_bridge.disconnected = False
 
         # Replace shared CCGX_data contents (same object refs used by modules)
         ctrl.CCGX_data.clear()
@@ -394,3 +409,74 @@ def test_cycle_persists_state_when_state_machine_changes_it(cycle_controller):
         save.assert_called_once()
         # Snapshot refreshed after save path
         assert ctrl._ess_controller_state_snapshot["time_of_last_change"] == "forced-for-test"
+
+
+def test_cycle_exception_applies_software_safe_state(cycle_controller):
+    """Domain errors are caught; charge/discharge forced to 0; timer survives."""
+    ctrl, mock_client = cycle_controller
+
+    with patch.object(
+        ctrl.state_machine, "update", side_effect=RuntimeError("boom")
+    ):
+        # Must not raise out of the cycle entry point
+        ctrl.ess_control_cycle_update()
+
+    published = _published_by_leaf(mock_client)
+    assert published.get("MaxChargeCurrent") == 0
+    assert published.get("MaxDischargePower") == 0
+
+
+def test_on_mqtt_connected_starts_timers_once(cycle_controller):
+    """Timers start on first connect callback, not in __init__."""
+    ctrl, mock_client = cycle_controller
+    assert ctrl._timers_started is False
+    assert ctrl.rt_ess_control_update_obj is None
+
+    ctrl.mqtt_bridge.client = mock_client
+    ctrl._on_mqtt_connected(is_reconnect=False)
+
+    assert ctrl._timers_started is True
+    assert ctrl.rt_ess_control_update_obj is not None
+    assert ctrl.rt_keep_alive_obj is not None
+
+    # Second call (reconnect) does not create another set of timers
+    first_cycle_timer = ctrl.rt_ess_control_update_obj
+    ctrl._on_mqtt_connected(is_reconnect=True)
+    assert ctrl.rt_ess_control_update_obj is first_cycle_timer
+
+
+def test_run_survives_mqtt_disconnect(cycle_controller):
+    """Main loop is driven by _running, not by is_connected (P0)."""
+    ctrl, mock_client = cycle_controller
+    sleeps = []
+
+    def fake_sleep(_s):
+        sleeps.append(1)
+        # First wake: still "connected"; second: disconnect; third: stop process
+        if len(sleeps) == 2:
+            ctrl.mqtt_bridge.connection_ok = False
+        if len(sleeps) >= 3:
+            ctrl._running = False
+
+    with patch.object(ctrl.mqtt_bridge, "start"), \
+         patch("essBATT_controller.time.sleep", side_effect=fake_sleep), \
+         patch.object(ctrl, "_install_signal_handlers"):
+        ctrl.mqtt_bridge.connection_ok = True
+        ctrl.run()
+
+    # Loop continued after disconnect (at least 3 iterations)
+    assert len(sleeps) >= 3
+    assert ctrl._running is False
+
+
+def test_maybe_warn_long_disconnect(cycle_controller):
+    ctrl, _mock = cycle_controller
+    ctrl.mqtt_bridge.connection_ok = False
+    ctrl.mqtt_bridge.disconnected_since = 0.0
+    # Force duration above threshold
+    with patch("essBATT_controller.time.time", return_value=100.0), \
+         patch.object(ctrl.mqtt_bridge, "disconnect_duration_s", return_value=45.0):
+        ctrl._last_disconnect_warn_at = None
+        ctrl._maybe_warn_long_disconnect()
+        ctrl.logger.warning.assert_called()
+        assert "disconnected" in ctrl.logger.warning.call_args.args[0].lower()

@@ -26,6 +26,7 @@
 import copy
 import logging
 from logging.handlers import RotatingFileHandler
+import signal
 import time
 
 import constants
@@ -47,10 +48,17 @@ class essBATT_controller:
 
     Domain modules and MQTT plumbing are composed here; business logic lives
     in the dedicated modules (protection, state machine, setpoints, etc.).
+
+    Process lifetime follows ``self._running`` (signals / intentional stop),
+    *not* momentary MQTT connectivity — short broker interruptions are
+    tolerated while paho auto-reconnects and resubscribes.
     """
 
     def __init__(self, logger):
         self.logger = logger
+        self._running = False
+        self._timers_started = False
+        self._last_disconnect_warn_at = None
         self.ess_internal_state = {}
         self.ess_config_data = {}
         self.ess_setvalue_list = {}
@@ -115,7 +123,7 @@ class essBATT_controller:
         self.ingestion = CcgxIngestion(self.logger, self.CCGX_data)
         self.victron_output = VictronOutput(
             self.logger,
-            mqtt_client=None,  # set in run() after bridge creates the client
+            mqtt_client=None,  # set on first MQTT connect
             ccgx_data=self.CCGX_data,
             setvalue_list=self.ess_setvalue_list,
             write_base_path=self.write_base_path,
@@ -130,48 +138,127 @@ class essBATT_controller:
             self.ess_config_data,
             self.ingestion,
             self.external_handlers,
+            on_connected=self._on_mqtt_connected,
         )
 
-        self.rt_keep_alive_obj = RepeatedTimer(constants.CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
-        self.rt_ess_control_update_obj = RepeatedTimer(
-            self.ess_config_data.get('control_update_rate', 2.0), self.ess_control_cycle_update
-        )
-        self.rt_print_status_obj = RepeatedTimer(
-            self.ess_config_data.get('script_alive_logging_interval', 86400),
-            self.print_alive_status_to_logger
-        )
+        # Timers are started only after the first successful MQTT connect (P3)
+        self.rt_keep_alive_obj = None
+        self.rt_ess_control_update_obj = None
+        self.rt_print_status_obj = None
 
     # ------------------------------------------------------------------
     # Application lifecycle
     # ------------------------------------------------------------------
-    def run(self):
-        """Connect MQTT, then keep the process alive while timers run the cycle."""
-        try:
-            self.mqtt_bridge.start()
-            self.victron_output.set_mqtt_client(self.mqtt_bridge.client)
-            # Immediate keepalive so Cerbo starts publishing before first timer tick
-            self.send_keepalive_to_cerbo()
+    def _install_signal_handlers(self):
+        """Map SIGTERM/SIGINT to a clean ``_running = False`` exit."""
+        def _handler(signum, frame):
+            try:
+                name = signal.Signals(signum).name
+            except Exception:
+                name = str(signum)
+            self.logger.warning(
+                "Received signal " + name + " — shutting down cleanly."
+            )
+            self._running = False
 
-            while self.mqtt_bridge.is_connected:
-                # ess_control_cycle_update() runs via RepeatedTimer; avoid busy-wait
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, _handler)
+            except (ValueError, OSError) as e:
+                # ValueError if not in main thread — ignore in tests
+                self.logger.debug("Could not install handler for " + str(sig) + ": " + str(e))
+
+    def _start_timers(self):
+        """Start background timers once MQTT is available."""
+        if self._timers_started:
+            return
+        self.rt_keep_alive_obj = RepeatedTimer(
+            constants.CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo
+        )
+        self.rt_ess_control_update_obj = RepeatedTimer(
+            self.ess_config_data.get('control_update_rate', 2.0),
+            self.ess_control_cycle_update,
+        )
+        self.rt_print_status_obj = RepeatedTimer(
+            self.ess_config_data.get('script_alive_logging_interval', 86400),
+            self.print_alive_status_to_logger,
+        )
+        self._timers_started = True
+        self.logger.info("Background timers started (control cycle, keepalive, alive log).")
+
+    def _on_mqtt_connected(self, is_reconnect=False):
+        """Called from MqttBridge after every successful CONNACK + subscribe."""
+        if self.mqtt_bridge.client is not None:
+            self.victron_output.set_mqtt_client(self.mqtt_bridge.client)
+        self.send_keepalive_to_cerbo()
+        if not self._timers_started:
+            self._start_timers()
+        if is_reconnect:
+            self.logger.info(
+                "MQTT session restored: resubscribed, keepalive sent, control continues."
+            )
+
+    def run(self):
+        """Connect MQTT, then keep the process alive until stop/signal.
+
+        Short MQTT drops do *not* end the process: paho reconnects, bridge
+        resubscribes, and the control cycle resumes when ``is_connected``.
+        """
+        self._running = True
+        self._install_signal_handlers()
+        try:
+            self.mqtt_bridge.start(
+                connect_timeout=constants.MQTT_INITIAL_CONNECT_TIMEOUT_S
+            )
+            # Timers + first keepalive are started from _on_mqtt_connected
+
+            while self._running:
+                self._maybe_warn_long_disconnect()
                 time.sleep(1)
         except OSError as e:
             self.logger.error('MQTT connection failed (network/OS): ' + str(e))
-            self.mqtt_bridge.stop()
-            self.mqtt_bridge.connection_ok = False
+            self._running = False
+        except TimeoutError as e:
+            self.logger.error('MQTT connection failed (timeout): ' + str(e))
+            self._running = False
         except Exception:
-            self.logger.exception('Unexpected error during MQTT setup')
-            self.mqtt_bridge.stop()
-            self.mqtt_bridge.connection_ok = False
+            self.logger.exception('Unexpected error during MQTT setup / main loop')
+            self._running = False
 
     def stop(self):
         """Stop background timers and MQTT loop (used on shutdown)."""
+        self._running = False
         for timer_attr in ('rt_keep_alive_obj', 'rt_ess_control_update_obj', 'rt_print_status_obj'):
             timer = getattr(self, timer_attr, None)
             if timer is not None:
-                timer.stop()
+                try:
+                    timer.stop()
+                except Exception:
+                    self.logger.exception("Error stopping timer " + timer_attr)
         if hasattr(self, 'mqtt_bridge') and self.mqtt_bridge is not None:
             self.mqtt_bridge.stop()
+        self._timers_started = False
+
+    def _maybe_warn_long_disconnect(self):
+        """Periodic warning while the broker is unreachable (P2 observability)."""
+        if self.mqtt_bridge.is_connected:
+            self._last_disconnect_warn_at = None
+            return
+        duration = self.mqtt_bridge.disconnect_duration_s()
+        if duration < constants.MQTT_DISCONNECT_WARN_AFTER_S:
+            return
+        now = time.time()
+        if (self._last_disconnect_warn_at is not None
+                and (now - self._last_disconnect_warn_at)
+                < constants.MQTT_DISCONNECT_WARN_INTERVAL_S):
+            return
+        self._last_disconnect_warn_at = now
+        self.logger.warning(
+            "MQTT still disconnected for "
+            + str(int(duration))
+            + "s — control cycle paused; waiting for paho auto-reconnect. "
+            + "Venus keeps last setpoints until we reassert them."
+        )
 
     # ------------------------------------------------------------------
     # Control cycle
@@ -181,6 +268,17 @@ class essBATT_controller:
         if not self.mqtt_bridge.is_connected:
             return
 
+        try:
+            self._ess_control_cycle_body()
+        except Exception:
+            # P2: never kill the timer thread; log and try software safe limits
+            self.logger.exception(
+                "Unhandled exception in control cycle — applying software safe state"
+            )
+            self._apply_software_safe_state(reason="control cycle exception")
+
+    def _ess_control_cycle_body(self):
+        """Core control cycle (exceptions handled by caller)."""
         # If feature is activated, read the ess_config.json file in each run
         if self.ess_config_data.get('check_ess_config_changes_while_running', 0) == 1:
             self.reload_config_while_running()
@@ -196,11 +294,7 @@ class essBATT_controller:
         if self.ess_external_input.get('deactivate_discharge', {}).get('activated'):
             local_values['deactivate_discharge_limit'] = 0.0
 
-        try:
-            self.state_machine.update(local_values)
-        except Exception:
-            self.logger.exception('Unhandled Exception!')
-            raise
+        self.state_machine.update(local_values)
 
         # "Static" ESS Mode 2 settings
         self.victron_output.set_ccgx_value(
@@ -226,27 +320,15 @@ class essBATT_controller:
         )
 
         if local_values.get('all_CCGX_values_available', False):
-            try:
-                self.battery_protector.calculate_dis_charge_limits(local_values)
-            except Exception:
-                self.logger.exception('Unhandled Exception in battery protection!')
-                raise
+            self.battery_protector.calculate_dis_charge_limits(local_values)
 
-            try:
-                self.state_machine.multis_switch_handling(local_values)
-                if 'multis_switch_position' in local_values:
-                    self.victron_output.set_multis_switch_mode(
-                        switch_position=local_values['multis_switch_position']
-                    )
-            except Exception:
-                self.logger.exception('Unhandled Exception!')
-                raise
+            self.state_machine.multis_switch_handling(local_values)
+            if 'multis_switch_position' in local_values:
+                self.victron_output.set_multis_switch_mode(
+                    switch_position=local_values['multis_switch_position']
+                )
 
-            try:
-                self.setpoint_calculator.calculate_ac_power_setpoint(local_values)
-            except Exception:
-                self.logger.exception('Unhandled Exception!')
-                raise
+            self.setpoint_calculator.calculate_ac_power_setpoint(local_values)
 
             self.victron_output.set_ccgx_value(
                 set_val_name_str='AcPowerSetPoint',
@@ -265,6 +347,32 @@ class essBATT_controller:
             )
 
         self.cleanup_after_control_loop()
+
+    def _apply_software_safe_state(self, reason=""):
+        """Best-effort: force charge/discharge limits to 0 while MQTT is up."""
+        if not self.mqtt_bridge.is_connected:
+            self.logger.error(
+                "Software safe state requested (" + reason
+                + ") but MQTT is down — cannot publish safe limits."
+            )
+            return
+        self.logger.error(
+            "Applying software safe state (" + reason
+            + "): MaxChargeCurrent=0, MaxDischargePower=0"
+        )
+        try:
+            self.victron_output.set_ccgx_value(
+                set_val_name_str='MaxChargeCurrent',
+                set_val=0,
+                only_set_if_deviation_to_current_setting=False,
+            )
+            self.victron_output.set_ccgx_value(
+                set_val_name_str='MaxDischargePower',
+                set_val=0,
+                only_set_if_deviation_to_current_setting=False,
+            )
+        except Exception:
+            self.logger.exception("Failed to publish software safe state limits")
 
     def cleanup_after_control_loop(self):
         # Compare in-memory state only; avoids reading ess_controller_state every cycle
@@ -288,7 +396,10 @@ class essBATT_controller:
         )
 
     def print_alive_status_to_logger(self):
-        self.logger.info('ESS Controller script is up and running!')
+        connected = "connected" if self.mqtt_bridge.is_connected else "DISCONNECTED"
+        self.logger.info(
+            "ESS Controller script is up and running! MQTT: " + connected
+        )
 
     def reload_config_while_running(self):
         """Reload ess_config.json and propagate to dependent modules (online tuning)."""
@@ -304,8 +415,10 @@ class essBATT_controller:
         self.logger.setLevel(
             constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data.get('debug_level', 'INFO')]
         )
-        if hasattr(self, 'rt_ess_control_update_obj') and self.rt_ess_control_update_obj is not None:
-            self.rt_ess_control_update_obj.interval = self.ess_config_data.get('control_update_rate', 2.0)
+        if self.rt_ess_control_update_obj is not None:
+            self.rt_ess_control_update_obj.interval = self.ess_config_data.get(
+                'control_update_rate', 2.0
+            )
         self.logger.debug('ess_config.json reloaded while running.')
 
 
@@ -333,7 +446,7 @@ if __name__ == "__main__":
             ess_controller_obj.run()
         finally:
             ess_controller_obj.logger.warning(
-                "essBATT controller: Shutdown. Control loop exited and needs restart."
+                "essBATT controller: Shutdown. Stopping timers and MQTT."
             )
             ess_controller_obj.stop()
     else:
