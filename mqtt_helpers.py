@@ -1,9 +1,11 @@
 # This is free and unencumbered software released into the public domain.
 # (full license text omitted for brevity - same as original)
 
-"""Pure helpers for MQTT subscription lists and Victron keepalive topics.
+"""Pure helpers for MQTT subscription lists, Victron keepalive topics,
+and topic→callback registration tables.
 
-No MQTT client dependency — only builds topic structures from config.
+No hard dependency on a live MQTT client for the builders — only
+``register_topic_callbacks`` talks to the client.
 """
 
 
@@ -84,3 +86,88 @@ def build_keepalive_publish(vrm_id, keepalive_get_all_topics):
         topics_list = build_keepalive_selected_topics()
         return ("R/" + vrm_id + "/keepalive", json.dumps(topics_list))
     return None
+
+
+def _paho_msg_callback(handler):
+    """Adapt a one-arg handler(msg) to paho's (client, userdata, msg) signature."""
+    def callback(client, userdata, msg):
+        handler(msg)
+    return callback
+
+
+# Config topic key → ExternalControlHandlers method name
+EXTERNAL_TOPIC_HANDLER_KEYS = (
+    ('charge_battery_to_SOC', 'on_charge_to_soc'),
+    ('activate_top_balancing_mode', 'on_balancing'),
+    ('deactivate_discharge', 'on_deactivate_discharge'),
+    ('deactivate_charge', 'on_deactivate_charge'),
+    ('reboot_ess_controller', 'on_reboot'),
+)
+
+
+def build_ccgx_topic_bindings(base_path_str, ingestion):
+    """Build (topic, paho_callback) pairs for Victron CCGX data topics.
+
+    Args:
+        base_path_str: e.g. "N/<vrm_id>"
+        ingestion: CcgxIngestion instance (handlers take msg only)
+
+    Returns:
+        list of (topic_string, callback) suitable for register_topic_callbacks
+    """
+    relative = [
+        ("/grid/+/Ac/Power", ingestion.on_grid_power),
+        ("/grid/+/Ac/L1/Power", ingestion.on_L1_power),
+        ("/grid/+/Ac/L1/Current", ingestion.on_L1_current),
+        ("/grid/+/Ac/L2/Power", ingestion.on_L2_power),
+        ("/grid/+/Ac/L2/Current", ingestion.on_L2_current),
+        ("/grid/+/Ac/L3/Power", ingestion.on_L3_power),
+        ("/grid/+/Ac/L3/Current", ingestion.on_L3_current),
+        ("/battery/+/Soc", ingestion.on_battery_soc),
+        ("/battery/+/System/MaxCellVoltage", ingestion.on_battery_maxcellvoltage),
+        ("/battery/+/System/MinCellVoltage", ingestion.on_battery_mincellvoltage),
+        ("/battery/+/Dc/0/Temperature", ingestion.on_battery_temp),
+        ("/battery/+/Dc/0/Current", ingestion.on_battery_current),
+        ("/battery/+/Dc/0/Power", ingestion.on_battery_power),
+        ("/battery/+/Dc/0/Voltage", ingestion.on_battery_voltage),
+        ("/solarcharger/+/Yield/Power", ingestion.on_solarcharger_power),
+        ("/solarcharger/+/Dc/0/#", ingestion.on_solarcharger_dc_values),
+        ("/system/+/Ac/Consumption/#", ingestion.on_system_ac_consumption),
+        ("/settings/+/Settings/CGwacs/#", ingestion.on_settings_cgwacs),
+        ("/settings/+/Settings/SystemSetup/#", ingestion.on_settings_system_setup),
+        ("/vebus/+/Mode", ingestion.on_multis_switch_mode),
+    ]
+    return [
+        (base_path_str + path, _paho_msg_callback(handler))
+        for path, handler in relative
+    ]
+
+
+def build_external_topic_bindings(config, external_handlers):
+    """Build (topic, paho_callback) pairs for configured external control topics.
+
+    Args:
+        config: ess_config data
+        external_handlers: ExternalControlHandlers instance
+
+    Returns:
+        list of (topic_string, callback); empty if external control disabled
+    """
+    bindings = []
+    ext = config.get('external_control_settings', {})
+    if ext.get('allow_external_control_over_mqtt') != 1:
+        return bindings
+
+    topics = ext.get('mqtt_external_control_topics', {})
+    for topic_key, handler_name in EXTERNAL_TOPIC_HANDLER_KEYS:
+        topic = topics.get(topic_key)
+        if topic and topic != "none":
+            handler = getattr(external_handlers, handler_name)
+            bindings.append((topic, _paho_msg_callback(handler)))
+    return bindings
+
+
+def register_topic_callbacks(mqtt_client, bindings):
+    """Register (topic, callback) pairs via mqtt_client.message_callback_add."""
+    for topic, callback in bindings:
+        mqtt_client.message_callback_add(topic, callback)

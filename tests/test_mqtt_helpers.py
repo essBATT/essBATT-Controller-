@@ -1,6 +1,8 @@
-"""Tests for mqtt_helpers (Step 6 of modularization)."""
+"""Tests for mqtt_helpers (Step 6 + callback registration table)."""
 
 import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -8,7 +10,12 @@ from mqtt_helpers import (
     build_subscription_list,
     build_keepalive_selected_topics,
     build_keepalive_publish,
+    build_ccgx_topic_bindings,
+    build_external_topic_bindings,
+    register_topic_callbacks,
 )
+from ccgx_ingestion import CcgxIngestion
+from external_control import ExternalControlHandlers
 
 
 def test_subscription_list_basic_without_external():
@@ -101,3 +108,79 @@ def test_keepalive_publish_selected_mode():
 def test_keepalive_publish_invalid_mode():
     assert build_keepalive_publish("VRM123", 99) is None
     assert build_keepalive_publish("VRM123", -1) is None
+
+
+def test_ccgx_topic_bindings_cover_core_paths():
+    logger = MagicMock()
+    ccgx_data = {'grid': {}, 'battery': {}, 'solarcharger': {}, 'settings': {}, 'system': {}}
+    ingestion = CcgxIngestion(logger, ccgx_data)
+    bindings = build_ccgx_topic_bindings("N/test_vrm", ingestion)
+
+    topics = [t for t, _ in bindings]
+    assert "N/test_vrm/grid/+/Ac/Power" in topics
+    assert "N/test_vrm/battery/+/Soc" in topics
+    assert "N/test_vrm/battery/+/System/MaxCellVoltage" in topics
+    assert "N/test_vrm/solarcharger/+/Dc/0/#" in topics
+    assert "N/test_vrm/settings/+/Settings/CGwacs/#" in topics
+    assert "N/test_vrm/vebus/+/Mode" in topics
+    assert len(bindings) == 20
+    # All callbacks are paho-compatible (client, userdata, msg)
+    for _topic, cb in bindings:
+        assert callable(cb)
+
+
+def test_ccgx_binding_callback_invokes_ingestion():
+    logger = MagicMock()
+    ccgx_data = {'grid': {}, 'battery': {}, 'solarcharger': {}, 'settings': {}, 'system': {}}
+    ingestion = CcgxIngestion(logger, ccgx_data)
+    bindings = build_ccgx_topic_bindings("N/vrm", ingestion)
+    by_topic = dict(bindings)
+
+    msg = SimpleNamespace(
+        topic="N/vrm/battery/0/Soc",
+        payload=json.dumps({"value": 77}).encode("utf-8"),
+    )
+    by_topic["N/vrm/battery/+/Soc"](None, None, msg)
+    assert ccgx_data["battery"]["soc"] == 77
+
+
+def test_external_topic_bindings_disabled():
+    handlers = ExternalControlHandlers(MagicMock(), {})
+    config = {
+        "external_control_settings": {
+            "allow_external_control_over_mqtt": 0,
+            "mqtt_external_control_topics": {
+                "charge_battery_to_SOC": "iobroker/charge",
+            },
+        }
+    }
+    assert build_external_topic_bindings(config, handlers) == []
+
+
+def test_external_topic_bindings_skips_none():
+    handlers = ExternalControlHandlers(MagicMock(), {})
+    config = {
+        "external_control_settings": {
+            "allow_external_control_over_mqtt": 1,
+            "mqtt_external_control_topics": {
+                "charge_battery_to_SOC": "iobroker/charge",
+                "activate_top_balancing_mode": "none",
+                "deactivate_discharge": "iobroker/no_dis",
+                "deactivate_charge": "none",
+                "reboot_ess_controller": "none",
+            },
+        }
+    }
+    bindings = build_external_topic_bindings(config, handlers)
+    topics = [t for t, _ in bindings]
+    assert topics == ["iobroker/charge", "iobroker/no_dis"]
+
+
+def test_register_topic_callbacks_calls_message_callback_add():
+    client = MagicMock()
+    cb1 = MagicMock()
+    cb2 = MagicMock()
+    register_topic_callbacks(client, [("topic/a", cb1), ("topic/b", cb2)])
+    assert client.message_callback_add.call_count == 2
+    client.message_callback_add.assert_any_call("topic/a", cb1)
+    client.message_callback_add.assert_any_call("topic/b", cb2)

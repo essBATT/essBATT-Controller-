@@ -1,15 +1,16 @@
 # This is free and unencumbered software released into the public domain.
 # (full license text omitted for brevity - same as original)
 
-"""Publish Victron ESS Mode 2 setpoints and Multi switch commands over MQTT."""
+"""Publish Victron ESS Mode 2 setpoints, Multi switch commands, and keepalive over MQTT."""
 
 import json
 
 import constants
+from mqtt_helpers import build_keepalive_publish
 
 
 class VictronOutput:
-    """Sends setpoints to Venus OS / Cerbo via MQTT.
+    """Sends setpoints and keepalive to Venus OS / Cerbo via MQTT.
 
     Dependencies are injected so unit tests can mock the MQTT client.
     """
@@ -111,3 +112,48 @@ class VictronOutput:
                 'to be investigated!!!'
             )
         return published
+
+    def send_keepalive(self, vrm_id, keepalive_get_all_topics):
+        """Publish a Cerbo/Venus dbus-mqtt keepalive.
+
+        See https://github.com/victronenergy/dbus-mqtt and ESS Mode 2 docs.
+
+        Args:
+            vrm_id: Victron VRM portal id
+            keepalive_get_all_topics: 0 = selected topic list, 1 = all topics via Serial
+
+        Returns:
+            True if a publish was attempted, False if skipped / invalid / error
+        """
+        if self.mqtt_client is None:
+            return False
+        try:
+            pub = build_keepalive_publish(vrm_id, keepalive_get_all_topics)
+            if pub is None:
+                self.logger.warning(
+                    'Invalid keepalive_get_all_topics value: ' + str(keepalive_get_all_topics)
+                )
+                return False
+            topic_string, payload = pub
+            if keepalive_get_all_topics == 1:
+                errcode = self.mqtt_client.publish(
+                    topic_string, payload=payload, qos=0, retain=False
+                )
+                self.logger.debug(
+                    "Keepalive (all topics) message send! Errorcode: "
+                    + str(errcode) + ". Published topic: '" + topic_string
+                )
+            else:
+                errcode = self.mqtt_client.publish(topic_string, payload)
+                self.logger.debug(
+                    "Keepalive (selected topics) message send! Errorcode: "
+                    + str(errcode) + ". Published topic: '" + topic_string
+                    + '. Payload: ' + payload
+                )
+            return True
+        except (KeyError, TypeError, ValueError) as e:
+            self.logger.warning('Failed to publish keepalive message to Cerbo: ' + str(e))
+            return False
+        except Exception:
+            self.logger.exception('Unexpected error while publishing keepalive to Cerbo')
+            return False

@@ -136,3 +136,71 @@ def apply_parsed_command(external_input, command_key, parsed, receive_time=None)
     external_input[command_key]['receive_time'] = receive_time
     external_input['new_data_received'] = True
     return external_input
+
+
+class ExternalControlHandlers:
+    """MQTT message handlers for external control topics.
+
+    Methods accept a msg-like object with .payload (and optionally .topic).
+    Wire them via mqtt_helpers.build_external_topic_bindings().
+    """
+
+    def __init__(self, logger, external_input, reboot_callback=None):
+        """
+        Args:
+            logger: logger instance
+            external_input: shared mutable ess_external_input dict
+            reboot_callback: optional callable invoked when reboot command is True
+        """
+        self.logger = logger
+        self.external_input = external_input
+        self.reboot_callback = reboot_callback
+
+    def on_charge_to_soc(self, msg):
+        try:
+            parsed = parse_charge_to_soc_payload(msg.payload)
+        except ExternalCommandError as e:
+            self.logger.error(str(e))
+            return
+        apply_parsed_command(self.external_input, 'charge_to_SOC', parsed)
+
+    def on_balancing(self, msg):
+        try:
+            parsed = parse_balancing_payload(msg.payload)
+        except ExternalCommandError as e:
+            self.logger.error(str(e))
+            return
+        apply_parsed_command(self.external_input, 'balancing', parsed)
+
+    def on_deactivate_discharge(self, msg):
+        try:
+            activation_state = parse_bool_payload(msg.payload)
+        except ExternalCommandError as e:
+            self.logger.error(str(e))
+            return
+        apply_parsed_command(self.external_input, 'deactivate_discharge', activation_state)
+        if activation_state:
+            self.logger.info('"DISCHARGING" is now "DEACTIVATED"!')
+        else:
+            self.logger.info('"DISCHARGING" is now "ALLOWED"!')
+
+    def on_deactivate_charge(self, msg):
+        try:
+            activation_state = parse_bool_payload(msg.payload)
+        except ExternalCommandError as e:
+            self.logger.error(str(e))
+            return
+        apply_parsed_command(self.external_input, 'deactivate_charge', activation_state)
+        if activation_state:
+            self.logger.info('"CHARGING" is now "DEACTIVATED"!')
+        else:
+            self.logger.info('"CHARGING" is now "ALLOWED"!')
+
+    def on_reboot(self, msg):
+        try:
+            reboot = parse_bool_payload(msg.payload)
+        except ExternalCommandError as e:
+            self.logger.error(str(e))
+            return
+        if reboot and self.reboot_callback is not None:
+            self.reboot_callback()

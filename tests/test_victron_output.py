@@ -106,3 +106,37 @@ def test_set_mqtt_client_updates_reference(output):
     output.set_mqtt_client(new_client)
     output.set_ccgx_value("MaxChargeCurrent", 10, only_set_if_deviation_to_current_setting=True)
     new_client.publish.assert_called_once()
+
+
+def test_send_keepalive_selected_topics(output, mqtt_client):
+    ok = output.send_keepalive("VRM123", 0)
+    assert ok is True
+    mqtt_client.publish.assert_called_once()
+    args = mqtt_client.publish.call_args
+    # positional: topic, payload
+    assert args.args[0] == "R/VRM123/keepalive"
+    payload = args.args[1]
+    parsed = json.loads(payload)
+    assert "battery/+/Soc" in parsed
+
+
+def test_send_keepalive_all_topics_mode(output, mqtt_client):
+    ok = output.send_keepalive("VRM123", 1)
+    assert ok is True
+    mqtt_client.publish.assert_called_once()
+    call = mqtt_client.publish.call_args
+    # mode 1: publish(topic, payload=..., qos=0, retain=False)
+    assert call.args[0] == "R/VRM123/system/0/Serial"
+    assert call.kwargs.get("qos") == 0
+    assert call.kwargs.get("retain") is False
+    assert call.kwargs.get("payload") == ""
+
+
+def test_send_keepalive_invalid_mode(output, mqtt_client):
+    assert output.send_keepalive("VRM123", 99) is False
+    mqtt_client.publish.assert_not_called()
+
+
+def test_send_keepalive_no_client(output):
+    output.mqtt_client = None
+    assert output.send_keepalive("VRM123", 0) is False

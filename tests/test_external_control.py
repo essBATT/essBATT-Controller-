@@ -1,10 +1,13 @@
-"""Tests for external_control command parsing (Step 7)."""
+"""Tests for external_control command parsing and handlers (Step 7 + handlers)."""
 
 import pytest
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from external_control import (
     ExternalCommandError,
+    ExternalControlHandlers,
     parse_bool_payload,
     parse_charge_to_soc_payload,
     parse_balancing_payload,
@@ -112,3 +115,71 @@ def test_apply_deactivate_does_not_set_new_data_flag():
 
     apply_parsed_command(ext, "deactivate_discharge", False)
     assert ext["deactivate_discharge"]["activated"] is False
+
+
+# --- ExternalControlHandlers ---
+
+def _msg(payload):
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    return SimpleNamespace(payload=payload, topic="test/topic")
+
+
+def test_handler_charge_to_soc():
+    ext = {}
+    h = ExternalControlHandlers(MagicMock(), ext)
+    h.on_charge_to_soc(_msg("1/90/20/-/-"))
+    assert ext["charge_to_SOC"]["target_SOC"] == 90
+    assert ext["new_data_received"] is True
+
+
+def test_handler_charge_to_soc_invalid_logs_error():
+    logger = MagicMock()
+    ext = {}
+    h = ExternalControlHandlers(logger, ext)
+    h.on_charge_to_soc(_msg("bad"))
+    logger.error.assert_called()
+    assert "charge_to_SOC" not in ext
+
+
+def test_handler_balancing():
+    ext = {}
+    h = ExternalControlHandlers(MagicMock(), ext)
+    h.on_balancing(_msg("1/15/-/-"))
+    assert ext["balancing"]["activated"] == "1"
+    assert ext["balancing"]["current_limit_input"] == 15
+
+
+def test_handler_deactivate_charge_logs_state():
+    logger = MagicMock()
+    ext = {}
+    h = ExternalControlHandlers(logger, ext)
+    h.on_deactivate_charge(_msg("True"))
+    assert ext["deactivate_charge"]["activated"] is True
+    logger.info.assert_called()
+
+    h.on_deactivate_charge(_msg("False"))
+    assert ext["deactivate_charge"]["activated"] is False
+
+
+def test_handler_deactivate_discharge():
+    ext = {}
+    h = ExternalControlHandlers(MagicMock(), ext)
+    h.on_deactivate_discharge(_msg("true"))
+    assert ext["deactivate_discharge"]["activated"] is True
+
+
+def test_handler_reboot_calls_callback():
+    reboot = MagicMock()
+    h = ExternalControlHandlers(MagicMock(), {}, reboot_callback=reboot)
+    h.on_reboot(_msg("True"))
+    reboot.assert_called_once()
+
+    reboot.reset_mock()
+    h.on_reboot(_msg("False"))
+    reboot.assert_not_called()
+
+
+def test_handler_reboot_without_callback():
+    h = ExternalControlHandlers(MagicMock(), {})
+    h.on_reboot(_msg("True"))  # must not raise

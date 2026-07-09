@@ -37,16 +37,15 @@ from battery_protection import BatteryProtector
 from state_machine import StateMachine
 from data_mapper import CcgxDataMapper
 from setpoint_control import SetpointCalculator
-from mqtt_helpers import build_subscription_list, build_keepalive_publish
+from mqtt_helpers import (
+    build_subscription_list,
+    build_ccgx_topic_bindings,
+    build_external_topic_bindings,
+    register_topic_callbacks,
+)
 from ccgx_ingestion import CcgxIngestion
 from victron_output import VictronOutput
-from external_control import (
-    ExternalCommandError,
-    parse_charge_to_soc_payload,
-    parse_balancing_payload,
-    parse_bool_payload,
-    apply_parsed_command,
-)
+from external_control import ExternalControlHandlers
 
 
 ##################### essBATT Controller Class ##############
@@ -128,6 +127,12 @@ class essBATT_controller:
             setvalue_list=self.ess_setvalue_list,
             write_base_path=self.write_base_path,
         )
+        # External MQTT control handlers (wired via topic registration table)
+        self.external_handlers = ExternalControlHandlers(
+            self.logger,
+            self.ess_external_input,
+            reboot_callback=self.reboot_ess_controller_script,
+        )
 
         self.rt_keep_alive_obj = RepeatedTimer(constants.CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
         self.rt_ess_control_update_obj = RepeatedTimer(
@@ -167,7 +172,10 @@ class essBATT_controller:
             subscription_list_tmp = self.create_subscribtion_list(base_path_str)
             (result, mid) = self.mqtt_client.subscribe(subscription_list_tmp)
             self.logger.info("MQTT subscribtion function return value: " + str(result))
-            self.add_topic_specific_callbacks(base_path_str)
+            # Topic → handler registration table (CCGX + external control)
+            bindings = build_ccgx_topic_bindings(base_path_str, self.ingestion)
+            bindings.extend(build_external_topic_bindings(self.ess_config_data, self.external_handlers))
+            register_topic_callbacks(self.mqtt_client, bindings)
             # Send a keepalive directly after connected to MQTT server
             self.send_keepalive_to_cerbo()
             
@@ -288,54 +296,21 @@ class essBATT_controller:
         """Build MQTT subscription list (delegates to mqtt_helpers)."""
         return build_subscription_list(base_path_str, self.ess_config_data)
 
-    # set_CCGX_value / set_multis_switch_mode → VictronOutput (Step 7)
-    # MQTT CCGX handlers → CcgxIngestion (Step 7)
-    # External command parsing → external_control (Step 7)
-
     def reboot_ess_controller_script(self):
         # TODO
         self.logger.error('Reboot function not yet implemented!')
-    
+
     def send_keepalive_to_cerbo(self):
-        # Documentation needed to know which values to send how is here:
-        # https://github.com/victronenergy/dbus-mqtt
-        # https://www.victronenergy.com/live/ess:ess_mode_2_and_3
-        try:
-            if self.mqtt_client is None or not self.mqtt_connection_ok:
-                return
-            keepalive_mode = self.ess_config_data.get('keepalive_get_all_topics', 0)
-            pub = build_keepalive_publish(self.ess_config_data['vrm_id'], keepalive_mode)
-            if pub is None:
-                self.logger.warning(
-                    'Invalid keepalive_get_all_topics value: ' + str(keepalive_mode)
-                )
-                return
-            topic_string, payload = pub
-            if keepalive_mode == 1:
-                errcode = self.mqtt_client.publish(
-                    topic_string, payload=payload, qos=0, retain=False
-                )
-                self.logger.debug(
-                    "Keepalive (all topics) message send! Errorcode: "
-                    + str(errcode) + ". Published topic: '" + topic_string
-                )
-            else:
-                errcode = self.mqtt_client.publish(topic_string, payload)
-                self.logger.debug(
-                    "Keepalive (selected topics) message send! Errorcode: "
-                    + str(errcode) + ". Published topic: '" + topic_string
-                    + '. Payload: ' + payload
-                )
-        except (KeyError, TypeError, ValueError) as e:
-            self.logger.warning('Failed to publish keepalive message to Cerbo: ' + str(e))
-        except Exception:
-            self.logger.exception('Unexpected error while publishing keepalive to Cerbo')
-            
+        """Timer entry point: publish keepalive only while MQTT is connected."""
+        if not self.mqtt_connection_ok:
+            return
+        self.victron_output.send_keepalive(
+            self.ess_config_data.get('vrm_id'),
+            self.ess_config_data.get('keepalive_get_all_topics', 0),
+        )
+
     def print_alive_status_to_logger(self):
         self.logger.info('ESS Controller script is up and running!')
-
-    # All config and state related methods have been moved to ConfigManager (Step 2).
-    # See config_manager.py for load_config(), load_state(), save_state_if_changed(), etc.
 
     def reload_config_while_running(self):
         """Reload ess_config.json and propagate to dependent modules (online tuning)."""
@@ -354,67 +329,8 @@ class essBATT_controller:
         if hasattr(self, 'rt_ess_control_update_obj') and self.rt_ess_control_update_obj is not None:
             self.rt_ess_control_update_obj.interval = self.ess_config_data.get('control_update_rate', 2.0)
         self.logger.debug('ess_config.json reloaded while running.')
-    
-    def add_topic_specific_callbacks(self, base_path_str):
-        # Grid
-        topic_str = base_path_str + "/grid/+/Ac/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_grid_power)
-        topic_str = base_path_str + "/grid/+/Ac/L1/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L1_power)
-        topic_str = base_path_str + "/grid/+/Ac/L1/Current"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L1_current)
-        topic_str = base_path_str + "/grid/+/Ac/L2/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L2_power)
-        topic_str = base_path_str + "/grid/+/Ac/L2/Current"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L2_current)
-        topic_str = base_path_str + "/grid/+/Ac/L3/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L3_power)
-        topic_str = base_path_str + "/grid/+/Ac/L3/Current"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L3_current)
-        # Battery
-        topic_str = base_path_str + "/battery/+/Soc"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_soc)
-        topic_str = base_path_str + "/battery/+/System/MaxCellVoltage"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_maxcellvoltage)
-        topic_str = base_path_str + "/battery/+/System/MinCellVoltage"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_mincellvoltage)
-        topic_str = base_path_str + "/battery/+/Dc/0/Temperature"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_temp)
-        topic_str = base_path_str + "/battery/+/Dc/0/Current"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_current)
-        topic_str = base_path_str + "/battery/+/Dc/0/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_power)
-        topic_str = base_path_str + "/battery/+/Dc/0/Voltage"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_voltage)
-        # Solarcharger
-        topic_str = base_path_str + "/solarcharger/+/Yield/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_solarcharger_power)
-        topic_str = base_path_str + "/solarcharger/+/Dc/0/#"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_solarcharger_dc_values)
-        # System
-        topic_str = base_path_str + "/system/+/Ac/Consumption/#"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_system_AC_consumption)
-        # External Control
-        if(self.ess_config_data['external_control_settings']['allow_external_control_over_mqtt'] == 1):
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['charge_battery_to_SOC'] != "none"):
-                self.mqtt_client.message_callback_add(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['charge_battery_to_SOC'], self.on_msg_ext_charge_to_SOC)
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['activate_top_balancing_mode'] != "none"):
-                self.mqtt_client.message_callback_add(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['activate_top_balancing_mode'], self.on_msg_ext_balancing)
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_discharge'] != "none"):
-                self.mqtt_client.message_callback_add(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_discharge'], self.on_msg_ext_deactivate_discharge)
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_charge'] != "none"):
-                self.mqtt_client.message_callback_add(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_charge'], self.on_msg_ext_deactivate_charge)
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['reboot_ess_controller'] != "none"):
-                self.mqtt_client.message_callback_add(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['reboot_ess_controller'], self.on_msg_ext_reboot_ess_controller)
-        # Misc
-        topic_str = base_path_str + "/settings/+/Settings/CGwacs/#"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_settings_Cgwacs)
-        topic_str = base_path_str + "/settings/+/Settings/SystemSetup/#"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_settings_SystemSetup)
-        topic_str = base_path_str + "/vebus/+/Mode"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_multis_switch_mode)
-        
-    ##################### MQTT Callback Functions ##############
+
+    ##################### MQTT connection lifecycle callbacks ##############
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             self.logger.info("Success: Connected to MQTT Server with result code " + str(rc))
@@ -435,119 +351,7 @@ class essBATT_controller:
     def on_subscribe(self, client, userdata, mid, granted_qos):
         self.logger.debug("MQTT on_subscribe function called!")
 
-    # --- Victron CCGX ingestion (delegates to CcgxIngestion) ---
-    def on_msg_grid_power(self, client, userdata, msg):
-        self.ingestion.on_grid_power(msg)
 
-    def on_msg_L1_power(self, client, userdata, msg):
-        self.ingestion.on_L1_power(msg)
-
-    def on_msg_L1_current(self, client, userdata, msg):
-        self.ingestion.on_L1_current(msg)
-
-    def on_msg_L2_power(self, client, userdata, msg):
-        self.ingestion.on_L2_power(msg)
-
-    def on_msg_L2_current(self, client, userdata, msg):
-        self.ingestion.on_L2_current(msg)
-
-    def on_msg_L3_power(self, client, userdata, msg):
-        self.ingestion.on_L3_power(msg)
-
-    def on_msg_L3_current(self, client, userdata, msg):
-        self.ingestion.on_L3_current(msg)
-
-    def on_msg_battery_soc(self, client, userdata, msg):
-        self.ingestion.on_battery_soc(msg)
-
-    def on_msg_battery_maxcellvoltage(self, client, userdata, msg):
-        self.ingestion.on_battery_maxcellvoltage(msg)
-
-    def on_msg_battery_mincellvoltage(self, client, userdata, msg):
-        self.ingestion.on_battery_mincellvoltage(msg)
-
-    def on_msg_battery_temp(self, client, userdata, msg):
-        self.ingestion.on_battery_temp(msg)
-
-    def on_msg_battery_current(self, client, userdata, msg):
-        self.ingestion.on_battery_current(msg)
-
-    def on_msg_battery_power(self, client, userdata, msg):
-        self.ingestion.on_battery_power(msg)
-
-    def on_msg_battery_voltage(self, client, userdata, msg):
-        self.ingestion.on_battery_voltage(msg)
-
-    def on_msg_solarcharger_power(self, client, userdata, msg):
-        self.ingestion.on_solarcharger_power(msg)
-
-    def on_msg_solarcharger_dc_values(self, client, userdata, msg):
-        self.ingestion.on_solarcharger_dc_values(msg)
-
-    def on_msg_system_AC_consumption(self, client, userdata, msg):
-        self.ingestion.on_system_ac_consumption(msg)
-
-    def on_msg_settings_Cgwacs(self, client, userdata, msg):
-        self.ingestion.on_settings_cgwacs(msg)
-
-    def on_msg_settings_SystemSetup(self, client, userdata, msg):
-        self.ingestion.on_settings_system_setup(msg)
-
-    def on_msg_multis_switch_mode(self, client, userdata, msg):
-        self.ingestion.on_multis_switch_mode(msg)
-
-    # --- External control (delegates to external_control parsers) ---
-    def on_msg_ext_charge_to_SOC(self, client, userdata, msg):
-        try:
-            parsed = parse_charge_to_soc_payload(msg.payload)
-        except ExternalCommandError as e:
-            self.logger.error(str(e))
-            return
-        apply_parsed_command(self.ess_external_input, 'charge_to_SOC', parsed)
-
-    def on_msg_ext_balancing(self, client, userdata, msg):
-        try:
-            parsed = parse_balancing_payload(msg.payload)
-        except ExternalCommandError as e:
-            self.logger.error(str(e))
-            return
-        apply_parsed_command(self.ess_external_input, 'balancing', parsed)
-
-    def on_msg_ext_deactivate_discharge(self, client, userdata, msg):
-        try:
-            activation_state = parse_bool_payload(msg.payload)
-        except ExternalCommandError as e:
-            self.logger.error(str(e))
-            return
-        apply_parsed_command(self.ess_external_input, 'deactivate_discharge', activation_state)
-        if activation_state:
-            self.logger.info('"DISCHARGING" is now "DEACTIVATED"!')
-        else:
-            self.logger.info('"DISCHARGING" is now "ALLOWED"!')
-
-    def on_msg_ext_deactivate_charge(self, client, userdata, msg):
-        try:
-            activation_state = parse_bool_payload(msg.payload)
-        except ExternalCommandError as e:
-            self.logger.error(str(e))
-            return
-        apply_parsed_command(self.ess_external_input, 'deactivate_charge', activation_state)
-        if activation_state:
-            self.logger.info('"CHARGING" is now "DEACTIVATED"!')
-        else:
-            self.logger.info('"CHARGING" is now "ALLOWED"!')
-
-    def on_msg_ext_reboot_ess_controller(self, client, userdata, msg):
-        try:
-            reboot = parse_bool_payload(msg.payload)
-        except ExternalCommandError as e:
-            self.logger.error(str(e))
-            return
-        if reboot:
-            self.reboot_ess_controller_script()
-
-
-  
 if __name__ == "__main__":
     ######## Logger Config ###############
     log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(funcName)s(%(lineno)d) %(message)s')
