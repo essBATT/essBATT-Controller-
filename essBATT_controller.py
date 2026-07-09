@@ -29,16 +29,17 @@ import logging
 from logging.handlers import RotatingFileHandler
 import time
 import json
-import threading
-from datetime import datetime, timedelta
-import numbers
+from datetime import datetime
 
-# New modular imports (Step 1-4 of modularization)
+# Modular imports (Steps 1–6)
 import constants
 from utils import RepeatedTimer
 from config_manager import ConfigManager
 from battery_protection import BatteryProtector
 from state_machine import StateMachine
+from data_mapper import CcgxDataMapper
+from setpoint_control import SetpointCalculator
+from mqtt_helpers import build_subscription_list, build_keepalive_publish
 
 
 ##################### essBATT Controller Class ##############
@@ -101,6 +102,14 @@ class essBATT_controller:
             self.ess_controller_state,
             self.temporary_script_states,
             self.ess_external_input
+        )
+
+        # Step 5: Data mapper (CCGX → local_values) and setpoint calculator
+        self.data_mapper = CcgxDataMapper(self.logger)
+        self.setpoint_calculator = SetpointCalculator(
+            self.ess_config_data,
+            self.logger,
+            self.ess_controller_state,
         )
 
         self.rt_keep_alive_obj = RepeatedTimer(constants.CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
@@ -173,7 +182,7 @@ class essBATT_controller:
                     
             # Reading most often needed values to local variables for convenience (while checking if they are available)
             local_values = {}
-            self.read_values_to_local_dict(local_values)
+            self.data_mapper.read_values_to_local_dict(self.CCGX_data, local_values)
 
             # Ported: external deactivate flags affect limits (used by protector + multis_switch)
             if self.ess_external_input.get('deactivate_charge', {}).get('activated'):
@@ -184,7 +193,7 @@ class essBATT_controller:
             ############# State machine (Step 4) ##########################################
             try:
                 self.state_machine.update(local_values)
-            except Exception as e:
+            except Exception:
                 self.logger.exception('Unhandled Exception!')
                 raise
 
@@ -199,7 +208,7 @@ class essBATT_controller:
                 # Battery protection limits are now handled by BatteryProtector (Step 3)
                 try:
                     self.battery_protector.calculate_dis_charge_limits(local_values)
-                except Exception as e:
+                except Exception:
                     self.logger.exception('Unhandled Exception in battery protection!')
                     raise
                 # To save some power we want to switch off only the charger, the inverter or the complete multi if it is possible/makes sense
@@ -209,18 +218,14 @@ class essBATT_controller:
                     # Apply the switch if the state machine set a position
                     if 'multis_switch_position' in local_values:
                         self.set_multis_switch_mode(switch_position=local_values['multis_switch_position'])
-                except Exception as e:
+                except Exception:
                     self.logger.exception('Unhandled Exception!')
                     raise
                 
-                # Now we calculate the AcPowerSetPoint - usually this is around 0 for normal operation (default value specified in ess_config.json). This can be changed by internal and external input that requests:
-                # 1. Charge/Discharge to SOC x% with maximum current y starting at timestamp z
-                # 2. Starting balancing at timestamp z with maximum current y.
-                # 3. Scheduled balancing was startet by the script
-                # 4. Emergency or winter charging/discharging might be required
+                # AcPowerSetPoint (Step 5: SetpointCalculator)
                 try:
-                    self.AcPowerSetPoint_calculation(local_values)
-                except Exception as e:
+                    self.setpoint_calculator.calculate_ac_power_setpoint(local_values)
+                except Exception:
                     self.logger.exception('Unhandled Exception!')
                     raise
                               
@@ -260,134 +265,12 @@ class essBATT_controller:
     
             
     def create_subscribtion_list(self, base_path_str):
-        # Basic subscriptions
-        subscription_list = [(base_path_str + "/battery/#", 1),
-                             (base_path_str + "/grid/#", 1),
-                             (base_path_str + "/solarcharger/#", 1),
-                             (base_path_str + "/system/+/Ac/Consumption/#", 1),
-                             (base_path_str + "/settings/#", 1),
-                             (base_path_str + "/vebus/+/Mode", 1)]
-        # (optional) Subscriptions for external MQTT control    
-        if(self.ess_config_data['external_control_settings']['allow_external_control_over_mqtt'] == 1):
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['charge_battery_to_SOC'] != "none"):
-                subscription_list.append((self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['charge_battery_to_SOC'], 1))
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['activate_top_balancing_mode'] != "none"):
-                subscription_list.append((self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['activate_top_balancing_mode'], 1))
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_discharge'] != "none"):
-                subscription_list.append((self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_discharge'], 1))
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_charge'] != "none"):
-                subscription_list.append((self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_charge'], 1))  
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['reboot_ess_controller'] != "none"):
-                subscription_list.append((self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['reboot_ess_controller'], 1))                
-        return subscription_list
-                                       
-    
-    def AcPowerSetPoint_calculation(self, local_values):
-        local_values['AcPowerSetPoint'] = 0 # default case if something fails
-        if(self.ess_controller_state['current_state'] == "normal_operation"):
-            # In normal operation the AcPowerSetPoint is the user defined value taken from the ess_config file
-            local_values['AcPowerSetPoint'] = int(self.ess_config_data['ess_mode_2_settings']['grid_power_setpoint_2700'])
-            self.logger.debug('AcPowerSetPoint from NORMAL OPERATION set to:' + str(local_values['AcPowerSetPoint']))  
-        elif(self.ess_controller_state['current_state'] == 'charge_to_SOC'):
-            # First check if (dis)charge is limited by time
-            
-            # Calc AcPowerSetPoint based on the given or set (dis)charge limits. Calculated Setpoint is 10% higher given through the limits, loads and solarpower input because the maximum (dis)charge
-            # current should be reached and is of course limited by the separate CCGX limits. To put it differently: the current limit is NOT realized with the AcPowerSetPoint
-            # but with the current/power limits. AcPowerSetPoint is only set to 10% above the limit (+loads and solarpower), to have some fallback safety. Didn´t feel right to put an more or less unlimited power value out
-            # that might be much above the safety limit for the battery
-            if(self.ess_controller_state['charge_to_SOC']['requested_current_direction'] == 'charge'):
-                max_charge_power_final = ((local_values['charge_current_limit_final'] * local_values['battery_voltage']) + local_values['loads_total_power'] - local_values['solarcharger_power_sum']) * 1.1
-                local_values['AcPowerSetPoint'] = int(max_charge_power_final)        
-            elif(self.ess_controller_state['charge_to_SOC']['requested_current_direction'] == 'discharge'):
-                local_values['AcPowerSetPoint'] = int((-local_values['discharge_power_limit_final'] - local_values['solarcharger_power_sum'] + local_values['loads_total_power']) * 1.1)
-            elif(self.ess_controller_state['charge_to_SOC']['requested_current_direction'] == 'SOC_reached'):
-                local_values['AcPowerSetPoint'] = int(self.ess_config_data['ess_mode_2_settings']['grid_power_setpoint_2700'])
-            else:
-                self.logger.error('Unknwon requested discharge direction: ' + self.ess_controller_state['charge_to_SOC']['requested_current_direction'])
-                return
-            self.logger.debug('AcPowerSetPoint from CHARGE TO SOC set to:' + str(local_values['AcPowerSetPoint']))
-        elif(self.ess_controller_state['current_state'] == "balancing"):
-            # Calc AcPowerSetPoint based on the given or set (dis)charge limits and corrected with the power consumed by the loads
-            max_charge_power_final = ((local_values['charge_current_limit_final'] * local_values['battery_voltage']) + local_values['loads_total_power'] - local_values['solarcharger_power_sum']) * 1.1
-            local_values['AcPowerSetPoint'] = int(max_charge_power_final)  
-            self.logger.debug('AcPowerSetPoint from BALANCING set to:' + str(local_values['AcPowerSetPoint']))
-            self.logger.debug('AcPowerSetPoint Calculation:' + str(local_values['AcPowerSetPoint']) + '= (Current limit final:' + str(local_values['charge_current_limit_final']) + '* battery voltage: ' + str(local_values['battery_voltage']) + ') + total loads: ' + str(local_values['loads_total_power']) + ' - solarcharger input: ' + str(local_values['solarcharger_power_sum']))
-            pass
-        else:
-            self.logger.error('Unknown "current state". Check ess_controller_state file.')
-        pass
+        """Build MQTT subscription list (delegates to mqtt_helpers)."""
+        return build_subscription_list(base_path_str, self.ess_config_data)
 
-    # read_values_to_local_dict() remains in controller for now (will be refactored in later step - it prepares data from MQTT for the state machine and protector).
-    def read_values_to_local_dict(self, local_values):
-        local_values['all_CCGX_values_available'] = True
-        if('grid_power_sum' in self.CCGX_data['grid']):
-            local_values['grid_power_sum'] = self.CCGX_data['grid']['grid_power_sum']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('soc' in self.CCGX_data['battery']):
-            local_values['battery_soc'] = self.CCGX_data['battery']['soc']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('max_cell_voltage' in self.CCGX_data['battery']):
-            local_values['battery_max_cell_voltage'] = self.CCGX_data['battery']['max_cell_voltage']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('min_cell_voltage' in self.CCGX_data['battery']):
-            local_values['battery_min_cell_voltage'] = self.CCGX_data['battery']['min_cell_voltage']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('current' in self.CCGX_data['battery']):
-            local_values['battery_current'] = self.CCGX_data['battery']['current']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('power' in self.CCGX_data['battery']):
-            local_values['battery_power'] = self.CCGX_data['battery']['power']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('voltage' in self.CCGX_data['battery']):
-            local_values['battery_voltage'] = self.CCGX_data['battery']['voltage']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('L1_loads_power_consumption' in self.CCGX_data['system']):
-            local_values['l1_loads_power_consumtpion'] = self.CCGX_data['system']['L1_loads_power_consumption']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('L2_loads_power_consumption' in self.CCGX_data['system']):
-            local_values['l2_loads_power_consumtpion'] = self.CCGX_data['system']['L2_loads_power_consumption']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('L3_loads_power_consumption' in self.CCGX_data['system']):
-            local_values['l3_loads_power_consumtpion'] = self.CCGX_data['system']['L3_loads_power_consumption']
-        else:
-            local_values['all_CCGX_values_available'] = False
-                
-        local_values['solarcharger_power_sum'] = 0    
-        for element in self.CCGX_data['solarcharger']:
-            if('Power' in self.CCGX_data['solarcharger'][element]):
-                local_values['solarcharger_power_sum'] = local_values['solarcharger_power_sum'] + self.CCGX_data['solarcharger'][element]['Power']
-            else:
-                local_values['all_CCGX_values_available'] = False
-        local_values['solarcharger_current_sum'] = 0    
-        for element in self.CCGX_data['solarcharger']:
-            if('Current' in self.CCGX_data['solarcharger'][element]):
-                local_values['solarcharger_current_sum'] = local_values['solarcharger_current_sum'] + self.CCGX_data['solarcharger'][element]['Current']
-            else:
-                local_values['all_CCGX_values_available'] = False
-        
-        if(local_values['all_CCGX_values_available']):        
-            # Total loads power consumption
-            local_values['loads_total_power'] = local_values['l1_loads_power_consumtpion'] + local_values['l2_loads_power_consumtpion'] + local_values['l3_loads_power_consumtpion']
-            self.logger.debug('Loads total power: ' + str(local_values['loads_total_power']) + ', Loads L1 power: ' + str(local_values['l1_loads_power_consumtpion']) + ', Loads L2 power: ' + str(local_values['l2_loads_power_consumtpion']) + ', Loads L3 power: ' + str(local_values['l3_loads_power_consumtpion'])) 
-                        
-            # Estimation of the power losses from battery/solarcharger to AC loads. It might help the system to better respect the
-            # battery discharge/charge limits.
-            local_values['losses_dc2ac_est'] = (local_values['grid_power_sum'] - local_values['battery_power'] + local_values['solarcharger_power_sum']) - local_values['loads_total_power']
-            self.logger.debug('Estimated losses DC to AC: ' + str(local_values['losses_dc2ac_est']) + 'W')
-                    
-        self.logger.debug('Solarcharger power sum: ' + str(local_values['solarcharger_power_sum']) + ' Solarcharger current sum: ' + str(local_values['solarcharger_current_sum']))
-        if(not local_values['all_CCGX_values_available']):
-            self.logger.info('all_CCGX_values_available: "' + str(local_values['all_CCGX_values_available']) + '"')    # TODO: log level back to debug
-        
+    # AcPowerSetPoint_calculation and read_values_to_local_dict moved to
+    # SetpointCalculator / CcgxDataMapper (Step 5).
+
     def set_CCGX_value(self, set_val_name_str=None, set_val=0, only_set_if_deviation_to_current_setting=True):
         """Function description: Sets the corresponding value in CCGX over MQTT.
         Arguments:
@@ -448,42 +331,29 @@ class essBATT_controller:
         try:
             if self.mqtt_client is None or not self.mqtt_connection_ok:
                 return
-            # Sends keepalive to Victron OS in a way, that all available topics are returned (good for debugging but high network and system load)
-            if(self.ess_config_data['keepalive_get_all_topics'] == 1):
-                payload_string = ""
-                topic_string = "R/" + self.ess_config_data['vrm_id'] + "/system/0/Serial"
-                # Publish Topic
-                errcode = self.mqtt_client.publish(topic_string, payload=payload_string, qos=0, retain=False)
-                # Logging
-                log_string = "Keepalive (all topics) message send! Errorcode: " + str(errcode) + ". Published topic: \'" + topic_string
-                self.logger.debug(log_string)
-            # Sends keepalive to Vecus OS in a way, that only the required topics are returned
-            elif(self.ess_config_data['keepalive_get_all_topics'] == 0):
-                topic_string = "R/" + self.ess_config_data['vrm_id'] + "/keepalive"
-                topics_list = []                               
-                topics_list.append("battery/+/Dc/0/#")
-                topics_list.append("battery/+/Soc")
-                topics_list.append("battery/+/System/MaxCellVoltage")
-                topics_list.append("battery/+/System/MinCellVoltage")
-                topics_list.append("grid/+/Ac/Power")
-                topics_list.append("grid/+/Ac/L1/Power")
-                topics_list.append("grid/+/Ac/L1/Current")
-                topics_list.append("grid/+/Ac/L2/Power")
-                topics_list.append("grid/+/Ac/L2/Current")
-                topics_list.append("grid/+/Ac/L3/Power")
-                topics_list.append("grid/+/Ac/L3/Current")
-                topics_list.append("system/+/Ac/Consumption/#")
-                topics_list.append("solarcharger/+/Yield/Power")
-                topics_list.append("solarcharger/+/Dc/0/#")
-                topics_list.append("+/+/ProductId")
-                topics_list.append("settings/+/Settings/CGwacs/#")
-                topics_list.append("settings/+/Settings/SystemSetup/#")
-                topics_list.append("vebus/+/Mode")
-                payload = json.dumps(topics_list)
-                errcode = self.mqtt_client.publish(topic_string, payload)
-                self.logger.debug("Keepalive (selected topics) message send! Errorcode: " + str(errcode) + ". Published topic: \'" + topic_string + '. Payload: ' + payload)
+            keepalive_mode = self.ess_config_data.get('keepalive_get_all_topics', 0)
+            pub = build_keepalive_publish(self.ess_config_data['vrm_id'], keepalive_mode)
+            if pub is None:
+                self.logger.warning(
+                    'Invalid keepalive_get_all_topics value: ' + str(keepalive_mode)
+                )
+                return
+            topic_string, payload = pub
+            if keepalive_mode == 1:
+                errcode = self.mqtt_client.publish(
+                    topic_string, payload=payload, qos=0, retain=False
+                )
+                self.logger.debug(
+                    "Keepalive (all topics) message send! Errorcode: "
+                    + str(errcode) + ". Published topic: '" + topic_string
+                )
             else:
-                self.logger.warning('Invalid keepalive_get_all_topics value: ' + str(self.ess_config_data['keepalive_get_all_topics']))
+                errcode = self.mqtt_client.publish(topic_string, payload)
+                self.logger.debug(
+                    "Keepalive (selected topics) message send! Errorcode: "
+                    + str(errcode) + ". Published topic: '" + topic_string
+                    + '. Payload: ' + payload
+                )
         except (KeyError, TypeError, ValueError) as e:
             self.logger.warning('Failed to publish keepalive message to Cerbo: ' + str(e))
         except Exception:
@@ -505,6 +375,7 @@ class essBATT_controller:
         # Keep module config references in sync
         self.battery_protector.update_config(new_config)
         self.state_machine.config = new_config
+        self.setpoint_calculator.update_config(new_config)
         self.logger.setLevel(
             constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data.get('debug_level', 'INFO')]
         )
