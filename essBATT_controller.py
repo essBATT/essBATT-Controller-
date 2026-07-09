@@ -28,10 +28,8 @@ import paho.mqtt.client as mqtt
 import logging
 from logging.handlers import RotatingFileHandler
 import time
-import json
-from datetime import datetime
 
-# Modular imports (Steps 1–6)
+# Modular imports (Steps 1–7)
 import constants
 from utils import RepeatedTimer
 from config_manager import ConfigManager
@@ -40,6 +38,15 @@ from state_machine import StateMachine
 from data_mapper import CcgxDataMapper
 from setpoint_control import SetpointCalculator
 from mqtt_helpers import build_subscription_list, build_keepalive_publish
+from ccgx_ingestion import CcgxIngestion
+from victron_output import VictronOutput
+from external_control import (
+    ExternalCommandError,
+    parse_charge_to_soc_payload,
+    parse_balancing_payload,
+    parse_bool_payload,
+    apply_parsed_command,
+)
 
 
 ##################### essBATT Controller Class ##############
@@ -112,6 +119,16 @@ class essBATT_controller:
             self.ess_controller_state,
         )
 
+        # Step 7: MQTT ingestion (CCGX data) and Victron output (setpoints)
+        self.ingestion = CcgxIngestion(self.logger, self.CCGX_data)
+        self.victron_output = VictronOutput(
+            self.logger,
+            mqtt_client=None,  # set in run() after client is created
+            ccgx_data=self.CCGX_data,
+            setvalue_list=self.ess_setvalue_list,
+            write_base_path=self.write_base_path,
+        )
+
         self.rt_keep_alive_obj = RepeatedTimer(constants.CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
         self.rt_ess_control_update_obj = RepeatedTimer(
             self.ess_config_data.get('control_update_rate', 2.0), self.ess_control_cycle_update
@@ -129,6 +146,7 @@ class essBATT_controller:
     def run(self):        
         # Configuration of the MQTT Client object
         self.mqtt_client = mqtt.Client()
+        self.victron_output.set_mqtt_client(self.mqtt_client)
         self.mqtt_client.username_pw_set(username=self.ess_config_data['mqtt_username'], password=self.ess_config_data['mqtt_password'])
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_subscribe = self.on_subscribe
@@ -199,9 +217,9 @@ class essBATT_controller:
 
             ############ Calculate and write output values ################################
             # "Static" settings
-            self.set_CCGX_value(set_val_name_str='MaxFeedInPower', set_val=self.ess_config_data.get('ess_mode_2_settings', {}).get('max_system_grid_feed_in_power_2706', 0), only_set_if_deviation_to_current_setting=True)
-            self.set_CCGX_value(set_val_name_str='OvervoltageFeedIn', set_val=self.ess_config_data.get('ess_mode_2_settings', {}).get('feed_excess_dc_coupled_pv_into_grid_2707', 0), only_set_if_deviation_to_current_setting=True)
-            self.set_CCGX_value(set_val_name_str='PreventFeedback', set_val=self.ess_config_data.get('ess_mode_2_settings', {}).get('feed_excess_ac_coupled_pv_into_grid_2708', 0), only_set_if_deviation_to_current_setting=True)
+            self.victron_output.set_ccgx_value(set_val_name_str='MaxFeedInPower', set_val=self.ess_config_data.get('ess_mode_2_settings', {}).get('max_system_grid_feed_in_power_2706', 0), only_set_if_deviation_to_current_setting=True)
+            self.victron_output.set_ccgx_value(set_val_name_str='OvervoltageFeedIn', set_val=self.ess_config_data.get('ess_mode_2_settings', {}).get('feed_excess_dc_coupled_pv_into_grid_2707', 0), only_set_if_deviation_to_current_setting=True)
+            self.victron_output.set_ccgx_value(set_val_name_str='PreventFeedback', set_val=self.ess_config_data.get('ess_mode_2_settings', {}).get('feed_excess_ac_coupled_pv_into_grid_2708', 0), only_set_if_deviation_to_current_setting=True)
             
             # Only continue if all input values are available
             if local_values.get('all_CCGX_values_available', False):
@@ -217,7 +235,9 @@ class essBATT_controller:
                     self.state_machine.multis_switch_handling(local_values)
                     # Apply the switch if the state machine set a position
                     if 'multis_switch_position' in local_values:
-                        self.set_multis_switch_mode(switch_position=local_values['multis_switch_position'])
+                        self.victron_output.set_multis_switch_mode(
+                            switch_position=local_values['multis_switch_position']
+                        )
                 except Exception:
                     self.logger.exception('Unhandled Exception!')
                     raise
@@ -231,9 +251,9 @@ class essBATT_controller:
                               
                 # Publish only if the current settings value does not match the setpoint and if the setpoint was already transmitted over MQTT to save network bandwidth                      
                 # Values that change more often
-                self.set_CCGX_value(set_val_name_str='AcPowerSetPoint', set_val=local_values['AcPowerSetPoint'], only_set_if_deviation_to_current_setting=True)
-                self.set_CCGX_value(set_val_name_str='MaxChargeCurrent', set_val=local_values['charge_current_limit_final'], only_set_if_deviation_to_current_setting=True)
-                self.set_CCGX_value(set_val_name_str='MaxDischargePower', set_val=local_values['discharge_power_limit_final'], only_set_if_deviation_to_current_setting=True)
+                self.victron_output.set_ccgx_value(set_val_name_str='AcPowerSetPoint', set_val=local_values['AcPowerSetPoint'], only_set_if_deviation_to_current_setting=True)
+                self.victron_output.set_ccgx_value(set_val_name_str='MaxChargeCurrent', set_val=local_values['charge_current_limit_final'], only_set_if_deviation_to_current_setting=True)
+                self.victron_output.set_ccgx_value(set_val_name_str='MaxDischargePower', set_val=local_values['discharge_power_limit_final'], only_set_if_deviation_to_current_setting=True)
                 
             # All tasks done at the end of each control loop run
             self.cleanup_after_control_loop()
@@ -268,57 +288,9 @@ class essBATT_controller:
         """Build MQTT subscription list (delegates to mqtt_helpers)."""
         return build_subscription_list(base_path_str, self.ess_config_data)
 
-    # AcPowerSetPoint_calculation and read_values_to_local_dict moved to
-    # SetpointCalculator / CcgxDataMapper (Step 5).
-
-    def set_CCGX_value(self, set_val_name_str=None, set_val=0, only_set_if_deviation_to_current_setting=True):
-        """Function description: Sets the corresponding value in CCGX over MQTT.
-        Arguments:
-        set_val_name_str: [string] Victron name of the parameter found in ess_setvalue_list.json
-        set_val: [number] value to send to CCGX
-        only_set_if_deviation_to_current_setting: [True/False] If set to True it checks what the current setting in CCGX is and only if the new set value is different it sends the set command. False always sends the command.
-        return: 0: everything ok but no value send, 1: everything ok and value send, -1: error while sending"""
-        retval = 0
-        if(set_val_name_str is not None):
-            if(set_val_name_str in self.CCGX_data['settings']):
-                if(((only_set_if_deviation_to_current_setting is True) and (set_val != self.CCGX_data['settings'][set_val_name_str]))
-                or (only_set_if_deviation_to_current_setting is False)):
-                    try:
-                        topic_str = self.write_base_path + self.CCGX_data['settings_base_path'] + self.ess_setvalue_list[set_val_name_str]
-                        payload_str = json.dumps({"value": set_val})
-                        self.mqtt_client.publish(topic=topic_str, payload=payload_str, qos=1, retain=0)
-                        self.logger.debug(set_val_name_str + ': Published ' + payload_str + ' on ' + topic_str + '. self.CCGX_data["settings"]["' + set_val_name_str + '"]: ' + str(self.CCGX_data['settings'][set_val_name_str]))
-                        retval = 1
-                    except (TypeError, ValueError, KeyError) as e:
-                        self.logger.error(set_val_name_str + ' setpoint sending failed: ' + str(e))
-                        retval = -1
-        else: 
-            self.logger.error('No set value name given!')
-            retval = -1
-        return retval
-    
-    def set_multis_switch_mode(self, switch_position):
-        """
-        Possible values for "switch_position": 1=Charger Only; 2=Inverter Only; 3=On; 4=Off
-        See modbus tcp register list 3.10:
-        https://www.victronenergy.com/support-and-downloads/technical-information
-        com.victronenergy.vebus	Switch Position	33	uint16	1	0 to 65536	/Mode	yes	1	See Venus-OS manual for limitations, for example when VE.Bus BMS or DMC is installed.
-        """
-        if('vebus' in self.CCGX_data):
-            counter = 0
-            current_instance_id = ''
-            for key in self.CCGX_data['vebus']:
-                current_instance_id = str(key)
-                counter = counter + 1
-            # If the switch has a different position than the set value switch it to the new value
-            current_mode = self.CCGX_data['vebus'][current_instance_id].get('Mode')
-            if current_mode is None or current_mode != switch_position:
-                topic_str = self.write_base_path + 'vebus/' + current_instance_id + '/Mode'
-                payload_str = json.dumps({"value": switch_position})
-                self.mqtt_client.publish(topic=topic_str, payload=payload_str, qos=1, retain=0)
-                self.logger.info('"Multis SWITCH" switched to ' + constants.MULTIS_SWITCH_NUMBER_STRING_MAPPING[str(switch_position)] + '(value: ' + str(switch_position) + ')')
-            if(counter > 1):
-                self.logger.error('It seems that there is more than one instance of "vebus" available. This was not considered during development of the script and needs to be investigated!!!')
+    # set_CCGX_value / set_multis_switch_mode → VictronOutput (Step 7)
+    # MQTT CCGX handlers → CcgxIngestion (Step 7)
+    # External command parsing → external_control (Step 7)
 
     def reboot_ess_controller_script(self):
         # TODO
@@ -442,371 +414,138 @@ class essBATT_controller:
         topic_str = base_path_str + "/vebus/+/Mode"
         self.mqtt_client.message_callback_add(topic_str, self.on_msg_multis_switch_mode)
         
-    def _parse_victron_mqtt_value(self, msg):
-        """Parse Victron dbus-mqtt JSON payload for settings/system/vebus topics (no device-removed handling)."""
-        try:
-            payload = json.loads(msg.payload)
-        except json.JSONDecodeError:
-            self.logger.warning('Invalid JSON on MQTT topic ' + msg.topic + ': ' + str(msg.payload))
-            return None
-        if 'value' not in payload:
-            self.logger.warning('MQTT message without "value" on topic ' + msg.topic)
-            return None
-        return payload['value']
-
-    def device_removed_from_bus_detected(self, topic):
-        split_topic = topic.split('/')
-        device_type = split_topic[2]
-        device_instance = split_topic[3]
-        try:
-            # If the device is a solarcharger the internal structure has an entry for each solarcharger.
-            if(device_type != 'solarcharger'):
-                self.CCGX_data[device_type] = {}
-            else:
-                self.CCGX_data[device_type][device_instance] = {}
-            self.logger.info('Received json string without "value". Probably device removed from bus. Topic: ' + topic)
-        except KeyError as e:
-            self.logger.error('Deleting device instance due to empty payload failed: ' + str(e))
-        
-                         
     ##################### MQTT Callback Functions ##############
-    # The callback when this client recieves A CONNACK from the broker    
     def on_connect(self, client, userdata, flags, rc):
-        if rc==0:
-            self.logger.info("Success: Connected to MQTT Server with result code "+str(rc))
+        if rc == 0:
+            self.logger.info("Success: Connected to MQTT Server with result code " + str(rc))
             self.mqtt_connection_ok = True
             self.mqtt_disconnected = False
         else:
-            self.logger.error("Failed to connected to MQTT Server with result code "+str(rc))
+            self.logger.error("Failed to connected to MQTT Server with result code " + str(rc))
             self.mqtt_connection_ok = False
-        
-    # The callback when the MQTT broker disconnects
-    def on_disconnect(self, client, userdata, rc):
-        self.logger.warning("MQTT server disconnected. Reason: "  + str(rc))
-        self.mqtt_connection_ok = False
-        self.mqtt_disconnected  = True
-            
-    # The callback for when a PUBLISH message is received from the server.
-    def on_message(self, client, userdata, msg):
-        self.logger.debug("New unused (!!!) MQTT message: " + msg.topic +" "+ str(msg.payload))
-        #self.store_received_mqtt_message(msg.topic, msg.payload)
-        
-    def on_subscribe(self, client, userdata, mid, granted_qos):  # subscribe to mqtt broker
-        self.logger.debug("MQTT on_subscribe function called!")
-    ######### Topic specific callbacks ############################
-    # Grid
-    def on_msg_grid_power(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['grid_power_sum'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L1_power(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['L1_power'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L1_current(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['L1_current'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L2_power(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['L2_power'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L2_current(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['L2_current'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L3_power(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['L3_power'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L3_current(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['L3_current'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    # Battery
-    def on_msg_battery_soc(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['soc'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_maxcellvoltage(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['max_cell_voltage'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_mincellvoltage(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['min_cell_voltage'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_temp(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['temperature'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_current(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['current'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_power(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['power'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_voltage(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['voltage'] = json.loads(msg.payload)['value']
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-    # Solarcharger
-    # With "grid" and "battery" callbacks the callback functions only handle one value. With the solarchargers the message handling is 
-    # done a bit different, because the chargers are added and removed dynamically and you could also permantly add/remove a solarcharger and 
-    # this script should still work. That´s why these solarcharger callback functions are more complex and involve "topic parsing" and handle multiple values. 
-    # As long as a solarcharger is active on the bus values are stored. If it vanishes from the bus the whole data structure for this solarcharger
-    # is deleted.
-    def on_msg_solarcharger_power(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        try:
-            payload_value = json.loads(msg.payload)['value']
-            solar_charger_topic_id_str = split_topic[3]
-            # If this solarcharger is not known add it to the dictionary
-            if(solar_charger_topic_id_str not in self.CCGX_data['solarcharger']):
-                self.CCGX_data['solarcharger'][solar_charger_topic_id_str] = {}
-            # Store the power value
-            self.CCGX_data['solarcharger'][solar_charger_topic_id_str]['Power'] = payload_value
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-       
-    def on_msg_solarcharger_dc_values(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        try:
-            payload_value = json.loads(msg.payload)['value']
-            solar_charger_topic_id_str = split_topic[3]
-            value_name_str = split_topic[6]
-            # If this solarcharger is not known add it to the dictionary
-            if(solar_charger_topic_id_str not in self.CCGX_data['solarcharger']):
-                self.CCGX_data['solarcharger'][solar_charger_topic_id_str] = {}
-            # Store the value in the corresponding data field
-            self.CCGX_data['solarcharger'][solar_charger_topic_id_str][value_name_str] = payload_value
-        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus_detected(msg.topic)
-    
-    # System
-    def on_msg_system_AC_consumption(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        try:
-            phase_number = split_topic[6]
-            measurement_name = split_topic[7]
-        except IndexError:
-            self.logger.error('Malformed system consumption topic: ' + msg.topic)
-            return
-        if(phase_number != 'NumberOfPhases' and measurement_name == 'Power'):
-            payload_value = self._parse_victron_mqtt_value(msg)
-            if payload_value is not None:
-                value_name = phase_number + '_loads_power_consumption'
-                self.CCGX_data['system'][value_name] = payload_value
-            
-    # Misc
-    def on_msg_settings_Cgwacs(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        try:
-            value_name = split_topic[6]
-            settings_instance = split_topic[3]
-        except IndexError:
-            self.logger.error('Malformed settings CGwacs topic: ' + msg.topic)
-            return
-        payload_value = self._parse_victron_mqtt_value(msg)
-        if payload_value is None:
-            return
-        self.CCGX_data['settings'][value_name] = payload_value
-        if('settings_base_path' not in self.CCGX_data):
-            self.CCGX_data['settings_base_path'] = 'settings/' + settings_instance + '/Settings/'
-        
-    def on_msg_settings_SystemSetup(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        try:
-            value_name = split_topic[6]
-        except IndexError:
-            self.logger.error('Malformed settings SystemSetup topic: ' + msg.topic)
-            return
-        payload_value = self._parse_victron_mqtt_value(msg)
-        if payload_value is not None:
-            self.CCGX_data['settings'][value_name] = payload_value
-            
-    def on_msg_multis_switch_mode(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        try:
-            instance_id = split_topic[3]
-            value_name = split_topic[4]
-        except IndexError:
-            self.logger.error('Malformed vebus topic: ' + msg.topic)
-            return
-        payload_value = self._parse_victron_mqtt_value(msg)
-        if payload_value is None:
-            return
-        if('vebus' not in self.CCGX_data):
-            self.CCGX_data['vebus'] = {}
-        if(instance_id not in self.CCGX_data['vebus']):
-            self.CCGX_data['vebus'][instance_id] = {}
-        self.CCGX_data['vebus'][instance_id][value_name] = payload_value
 
-    # External
+    def on_disconnect(self, client, userdata, rc):
+        self.logger.warning("MQTT server disconnected. Reason: " + str(rc))
+        self.mqtt_connection_ok = False
+        self.mqtt_disconnected = True
+
+    def on_message(self, client, userdata, msg):
+        self.logger.debug("New unused (!!!) MQTT message: " + msg.topic + " " + str(msg.payload))
+
+    def on_subscribe(self, client, userdata, mid, granted_qos):
+        self.logger.debug("MQTT on_subscribe function called!")
+
+    # --- Victron CCGX ingestion (delegates to CcgxIngestion) ---
+    def on_msg_grid_power(self, client, userdata, msg):
+        self.ingestion.on_grid_power(msg)
+
+    def on_msg_L1_power(self, client, userdata, msg):
+        self.ingestion.on_L1_power(msg)
+
+    def on_msg_L1_current(self, client, userdata, msg):
+        self.ingestion.on_L1_current(msg)
+
+    def on_msg_L2_power(self, client, userdata, msg):
+        self.ingestion.on_L2_power(msg)
+
+    def on_msg_L2_current(self, client, userdata, msg):
+        self.ingestion.on_L2_current(msg)
+
+    def on_msg_L3_power(self, client, userdata, msg):
+        self.ingestion.on_L3_power(msg)
+
+    def on_msg_L3_current(self, client, userdata, msg):
+        self.ingestion.on_L3_current(msg)
+
+    def on_msg_battery_soc(self, client, userdata, msg):
+        self.ingestion.on_battery_soc(msg)
+
+    def on_msg_battery_maxcellvoltage(self, client, userdata, msg):
+        self.ingestion.on_battery_maxcellvoltage(msg)
+
+    def on_msg_battery_mincellvoltage(self, client, userdata, msg):
+        self.ingestion.on_battery_mincellvoltage(msg)
+
+    def on_msg_battery_temp(self, client, userdata, msg):
+        self.ingestion.on_battery_temp(msg)
+
+    def on_msg_battery_current(self, client, userdata, msg):
+        self.ingestion.on_battery_current(msg)
+
+    def on_msg_battery_power(self, client, userdata, msg):
+        self.ingestion.on_battery_power(msg)
+
+    def on_msg_battery_voltage(self, client, userdata, msg):
+        self.ingestion.on_battery_voltage(msg)
+
+    def on_msg_solarcharger_power(self, client, userdata, msg):
+        self.ingestion.on_solarcharger_power(msg)
+
+    def on_msg_solarcharger_dc_values(self, client, userdata, msg):
+        self.ingestion.on_solarcharger_dc_values(msg)
+
+    def on_msg_system_AC_consumption(self, client, userdata, msg):
+        self.ingestion.on_system_ac_consumption(msg)
+
+    def on_msg_settings_Cgwacs(self, client, userdata, msg):
+        self.ingestion.on_settings_cgwacs(msg)
+
+    def on_msg_settings_SystemSetup(self, client, userdata, msg):
+        self.ingestion.on_settings_system_setup(msg)
+
+    def on_msg_multis_switch_mode(self, client, userdata, msg):
+        self.ingestion.on_multis_switch_mode(msg)
+
+    # --- External control (delegates to external_control parsers) ---
     def on_msg_ext_charge_to_SOC(self, client, userdata, msg):
-        current_limit_used = False
-        starttime_used = False
-        startdate_used = False
         try:
-            payload = msg.payload.decode('utf-8')
-            split_payload = payload.split('/')
-            activated = split_payload[0]
-            target_soc = int(split_payload[1])
-            if(split_payload[2] != '-'):
-                current_limit = int(split_payload[2])
-                current_limit_used = True
-            if(split_payload[3] != '-'):
-                time_input = split_payload[3]
-                starttime_used = True
-            if(split_payload[4] != '-'):
-                date_input = split_payload[4]
-                startdate_used = True
-        except UnicodeDecodeError:
-            self.logger.error('charge_to_SOC payload is not valid UTF-8')
+            parsed = parse_charge_to_soc_payload(msg.payload)
+        except ExternalCommandError as e:
+            self.logger.error(str(e))
             return
-        except (IndexError, ValueError) as e:
-            self.logger.error('charge_to_SOC payload format invalid (expected activated/target_soc/current/time/date): ' + str(e))
-            return
-        if('charge_to_SOC' not in self.ess_external_input):
-            self.ess_external_input['charge_to_SOC'] = {}
-        self.ess_external_input['charge_to_SOC']['target_SOC'] = target_soc
-        self.ess_external_input['charge_to_SOC']['activated'] = activated
-        if(current_limit_used):
-            self.ess_external_input['charge_to_SOC']['current_limit_input'] = current_limit
-        if(starttime_used):
-            self.ess_external_input['charge_to_SOC']['time_input'] = time_input
-        if(startdate_used):
-            self.ess_external_input['charge_to_SOC']['date_input'] = date_input
-        self.ess_external_input['charge_to_SOC']['receive_time'] = datetime.now(tz=None)
-        self.ess_external_input['new_data_received'] = True
-            
+        apply_parsed_command(self.ess_external_input, 'charge_to_SOC', parsed)
+
     def on_msg_ext_balancing(self, client, userdata, msg):
-        current_limit_used = False
-        starttime_used = False
-        startdate_used = False
         try:
-            payload = msg.payload.decode('utf-8')
-            split_payload = payload.split('/')
-            activated = split_payload[0]
-            if(split_payload[1] != '-'):
-                current_limit = int(split_payload[1])
-                current_limit_used = True
-            if(split_payload[2] != '-'):
-                time_input = split_payload[2]
-                starttime_used = True
-            if(split_payload[3] != '-'):
-                date_input = split_payload[3]
-                startdate_used = True
-        except UnicodeDecodeError:
-            self.logger.error('balancing payload is not valid UTF-8')
+            parsed = parse_balancing_payload(msg.payload)
+        except ExternalCommandError as e:
+            self.logger.error(str(e))
             return
-        except (IndexError, ValueError) as e:
-            self.logger.error('balancing payload format invalid (expected activated/current/time/date): ' + str(e))
-            return
-        if('balancing' not in self.ess_external_input):
-            self.ess_external_input['balancing'] = {}
-        self.ess_external_input['balancing']['activated'] = activated
-        if(current_limit_used):
-            self.ess_external_input['balancing']['current_limit_input'] = current_limit
-        if(starttime_used):
-            self.ess_external_input['balancing']['time_input'] = time_input
-        if(startdate_used):
-            self.ess_external_input['balancing']['date_input'] = date_input
-        self.ess_external_input['balancing']['receive_time'] = datetime.now(tz=None)
-        self.ess_external_input['new_data_received'] = True
-    
+        apply_parsed_command(self.ess_external_input, 'balancing', parsed)
+
     def on_msg_ext_deactivate_discharge(self, client, userdata, msg):
         try:
-            payload = msg.payload.decode('utf-8')
-        except UnicodeDecodeError:
-            self.logger.error('deactivate_discharge payload is not valid UTF-8')
+            activation_state = parse_bool_payload(msg.payload)
+        except ExternalCommandError as e:
+            self.logger.error(str(e))
             return
-        if((payload == 'False') or (payload == 'false')):
-            activation_state = False
-        elif((payload == 'True') or (payload == 'true')):
-            activation_state = True
-        else:
-            self.logger.error('Unknown deactivate_discharge payload: ' + payload)
-            return
-        if('deactivate_discharge' not in self.ess_external_input):
-            self.ess_external_input['deactivate_discharge'] = {}
-        self.ess_external_input['deactivate_discharge']['activated'] = activation_state
-        self.ess_external_input['deactivate_discharge']['receive_time'] = datetime.now(tz=None)
-        if(activation_state):
+        apply_parsed_command(self.ess_external_input, 'deactivate_discharge', activation_state)
+        if activation_state:
             self.logger.info('"DISCHARGING" is now "DEACTIVATED"!')
         else:
             self.logger.info('"DISCHARGING" is now "ALLOWED"!')
-        
+
     def on_msg_ext_deactivate_charge(self, client, userdata, msg):
         try:
-            payload = msg.payload.decode('utf-8')
-        except UnicodeDecodeError:
-            self.logger.error('deactivate_charge payload is not valid UTF-8')
+            activation_state = parse_bool_payload(msg.payload)
+        except ExternalCommandError as e:
+            self.logger.error(str(e))
             return
-        if((payload == 'False') or (payload == 'false')):
-            activation_state = False
-        elif((payload == 'True') or (payload == 'true')):
-            activation_state = True
-        else:
-            self.logger.error('Unknown deactivate_charge payload: ' + payload)
-            return
-        if('deactivate_charge' not in self.ess_external_input):
-            self.ess_external_input['deactivate_charge'] = {}
-        self.ess_external_input['deactivate_charge']['activated'] = activation_state
-        self.ess_external_input['deactivate_charge']['receive_time'] = datetime.now(tz=None)
-        if(activation_state):
+        apply_parsed_command(self.ess_external_input, 'deactivate_charge', activation_state)
+        if activation_state:
             self.logger.info('"CHARGING" is now "DEACTIVATED"!')
         else:
             self.logger.info('"CHARGING" is now "ALLOWED"!')
-        
+
     def on_msg_ext_reboot_ess_controller(self, client, userdata, msg):
         try:
-            payload = msg.payload.decode('utf-8')
-        except UnicodeDecodeError:
-            self.logger.error('reboot payload is not valid UTF-8')
+            reboot = parse_bool_payload(msg.payload)
+        except ExternalCommandError as e:
+            self.logger.error(str(e))
             return
-        if((payload == 'False') or (payload == 'false')):
-            reboot = False
-        elif((payload == 'True') or (payload == 'true')):
-            reboot = True
-        else:
-            self.logger.error('Unknown reboot payload: ' + payload)
-            return
-        if(reboot is True):
+        if reboot:
             self.reboot_ess_controller_script()
 
-    ###############################################################
-            
-################################################################################################################################################################################
 
   
 if __name__ == "__main__":
