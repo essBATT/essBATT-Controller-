@@ -1,4 +1,4 @@
-# Run the full pytest suite on every push and pull request.
+# Run the full pytest suite (with coverage) on every push and pull request.
 name: pytest
 
 on:
@@ -34,5 +34,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Run tests
-        run: python -m pytest -q
+      # Full pytest log + coverage table appear in this step's log on GitHub Actions.
+      # Open the job → "Run tests with coverage" to expand the output.
+      - name: Run tests with coverage
+        run: |
+          python -m pytest -v \
+            --cov \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:htmlcov
+
+      # Downloadable HTML report (job summary page → Artifacts)
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html-py${{ matrix.python-version }}
+          path: htmlcov/
+          if-no-files-found: ignore

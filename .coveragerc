@@ -1,0 +1,24 @@
+# Coverage config for essBATT (used by pytest-cov in local runs and CI).
+[run]
+branch = False
+source =
+    .
+omit =
+    tests/*
+    venv/*
+    .venv/*
+    */site-packages/*
+    */__pycache__/*
+
+[report]
+# Fail CI if overall application coverage drops below this.
+fail_under = 75
+precision = 1
+show_missing = True
+skip_empty = True
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+
+[html]
+directory = htmlcov
