@@ -185,11 +185,12 @@ class essBATT_controller:
                 time.sleep(1)
             #######################################
 
-        except OSError as e:
-            self.logger.error('MQTT connection failed (network/OS): ' + str(e))
-            self._running = False
+        # TimeoutError is an OSError subclass — must come first
         except TimeoutError as e:
             self.logger.error('MQTT connection failed (timeout): ' + str(e))
+            self._running = False
+        except OSError as e:
+            self.logger.error('MQTT connection failed (network/OS): ' + str(e))
             self._running = False
         except Exception:
             self.logger.exception('Unexpected error during MQTT setup / main loop')
