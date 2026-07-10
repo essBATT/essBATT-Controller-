@@ -177,11 +177,14 @@ class essBATT_controller:
             self.mqtt_bridge.start(
                 connect_timeout=constants.MQTT_INITIAL_CONNECT_TIMEOUT_S
             )
-            # MAIN CONTROL LOOP
+
+            ####### MAIN CONTROL LOOP #############
             while self._running:
-                # While we are sleeping in this loop the ess_control_cycle_update() function is called periodically (defined in ess_config.json) by the timer
+                # While we are sleeping in this loop the ess_control_cycle_update() function is called periodically (how often defined in ess_config.json) by the timer
                 self._maybe_warn_long_disconnect()
                 time.sleep(1)
+            #######################################
+
         except OSError as e:
             self.logger.error('MQTT connection failed (network/OS): ' + str(e))
             self._running = False
