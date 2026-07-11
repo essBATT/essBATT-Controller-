@@ -80,6 +80,8 @@ def _integration_config(**overrides):
         "script_alive_logging_interval": 86400,
         "check_ess_config_changes_while_running": 0,
         "keepalive_get_all_topics": 0,
+        "controller_heartbeat_topic": "essbatt/controller/heartbeat",
+        "controller_heartbeat_interval_s": 30.0,
         "ess_mode_2_settings": {
             "grid_power_setpoint_2700": 1,
             "max_power_fed_to_loads_2704": 300,

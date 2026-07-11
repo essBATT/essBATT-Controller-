@@ -42,6 +42,8 @@ def _base_config(**overrides):
         "script_alive_logging_interval": 86400,
         "check_ess_config_changes_while_running": 0,
         "keepalive_get_all_topics": 0,
+        "controller_heartbeat_topic": "essbatt/controller/heartbeat",
+        "controller_heartbeat_interval_s": 30.0,
         "ess_mode_2_settings": {
             "grid_power_setpoint_2700": 1,
             "max_battery_discharge_current": 50,
@@ -362,6 +364,78 @@ def test_keepalive_when_connected():
     with patch.object(ctrl.victron_output, "send_keepalive") as ka:
         ctrl.send_keepalive_to_cerbo()
     ka.assert_called_once_with("test_vrm_id", 0)
+
+
+def test_heartbeat_skipped_when_disconnected():
+    ctrl, _ = _build_controller()
+    ctrl.mqtt_bridge.connection_ok = False
+    ctrl.mqtt_bridge.client = MagicMock()
+    ctrl.send_controller_heartbeat()
+    ctrl.mqtt_bridge.client.publish.assert_not_called()
+
+
+def test_heartbeat_published_when_connected():
+    import json
+
+    ctrl, _ = _build_controller()
+    ctrl.mqtt_bridge.connection_ok = True
+    client = MagicMock()
+    ctrl.mqtt_bridge.client = client
+    with patch("essBATT_controller.time.time", return_value=1234.5):
+        ctrl.send_controller_heartbeat()
+    client.publish.assert_called_once()
+    kwargs = client.publish.call_args.kwargs
+    assert kwargs["topic"] == "essbatt/controller/heartbeat"
+    assert kwargs["qos"] == 0
+    assert kwargs["retain"] is False
+    payload = json.loads(kwargs["payload"])
+    assert payload["source"] == "essBATT_controller"
+    assert payload["vrm_id"] == "test_vrm_id"
+    assert payload["ts"] == 1234.5
+
+
+def test_heartbeat_disabled_when_topic_none():
+    ctrl, _ = _build_controller()
+    ctrl.ess_config_data["controller_heartbeat_topic"] = "none"
+    ctrl.mqtt_bridge.connection_ok = True
+    ctrl.mqtt_bridge.client = MagicMock()
+    ctrl.send_controller_heartbeat()
+    ctrl.mqtt_bridge.client.publish.assert_not_called()
+
+
+def test_start_timers_creates_heartbeat_timer():
+    ctrl, _ = _build_controller()
+    with patch("essBATT_controller.RepeatedTimer", _DummyTimer):
+        ctrl._start_timers()
+    assert ctrl.rt_controller_heartbeat_obj is not None
+    assert ctrl.rt_controller_heartbeat_obj.interval == 30.0
+    assert ctrl.rt_controller_heartbeat_obj.function == ctrl.send_controller_heartbeat
+
+
+def test_start_timers_skips_heartbeat_when_disabled():
+    ctrl, logger = _build_controller()
+    ctrl.ess_config_data["controller_heartbeat_topic"] = "none"
+    with patch("essBATT_controller.RepeatedTimer", _DummyTimer):
+        ctrl._start_timers()
+    assert ctrl.rt_controller_heartbeat_obj is None
+    assert any(
+        "heartbeat disabled" in str(c.args[0]).lower()
+        for c in logger.info.call_args_list
+    )
+
+
+def test_reload_updates_heartbeat_interval():
+    ctrl, _ = _build_controller()
+    ctrl.rt_controller_heartbeat_obj = _DummyTimer(30.0, lambda: None)
+    new_cfg = _base_config(controller_heartbeat_interval_s=15.0)
+
+    def load_config():
+        ctrl.config_manager.config_data_loaded_correctly = True
+        return copy.deepcopy(new_cfg)
+
+    ctrl.config_manager.load_config = load_config
+    ctrl.reload_config_while_running()
+    assert ctrl.rt_controller_heartbeat_obj.interval == 15.0
 
 
 def test_print_alive_status_connected_and_not():

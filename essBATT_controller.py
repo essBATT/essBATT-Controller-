@@ -36,6 +36,7 @@ the imported modules, not here.
 """
 
 import copy
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import signal
@@ -159,6 +160,7 @@ class essBATT_controller:
         self.rt_keep_alive_obj = None
         self.rt_ess_control_update_obj = None
         self.rt_print_status_obj = None
+        self.rt_controller_heartbeat_obj = None
 
     # ==================================================================
     # MAIN LOGIC — process lifetime
@@ -203,6 +205,7 @@ class essBATT_controller:
             'rt_keep_alive_obj',
             'rt_ess_control_update_obj',
             'rt_print_status_obj',
+            'rt_controller_heartbeat_obj',
         ):
             timer = getattr(self, timer_attr, None)
             if timer is not None:
@@ -341,9 +344,23 @@ class essBATT_controller:
             self.ess_config_data.get('script_alive_logging_interval', 86400),
             self.print_alive_status_to_logger,
         )
+        heartbeat_topic = self._heartbeat_topic()
+        if heartbeat_topic is not None:
+            self.rt_controller_heartbeat_obj = RepeatedTimer(
+                self._heartbeat_interval_s(),
+                self.send_controller_heartbeat,
+            )
+        else:
+            self.rt_controller_heartbeat_obj = None
+            self.logger.info(
+                'Controller heartbeat disabled '
+                '(controller_heartbeat_topic is none/empty).'
+            )
         self._timers_started = True
         self.logger.info(
-            'Background timers started (control cycle, keepalive, alive log).'
+            'Background timers started (control cycle, keepalive, alive log'
+            + (', heartbeat' if heartbeat_topic is not None else '')
+            + ').'
         )
 
     def _on_mqtt_connected(self, is_reconnect=False):
@@ -351,6 +368,7 @@ class essBATT_controller:
         if self.mqtt_bridge.client is not None:
             self.victron_output.set_mqtt_client(self.mqtt_bridge.client)
         self.send_keepalive_to_cerbo()
+        self.send_controller_heartbeat()
         if not self._timers_started:
             self._start_timers()
         if is_reconnect:
@@ -424,6 +442,54 @@ class essBATT_controller:
             self.ess_config_data.get('keepalive_get_all_topics', 0),
         )
 
+    def _heartbeat_topic(self):
+        """Return configured heartbeat topic, or None if disabled."""
+        topic = self.ess_config_data.get(
+            'controller_heartbeat_topic',
+            constants.DEFAULT_CONTROLLER_HEARTBEAT_TOPIC,
+        )
+        if topic is None or topic == '' or topic == 'none':
+            return None
+        return topic
+
+    def _heartbeat_interval_s(self):
+        """Heartbeat publish interval in seconds."""
+        return float(
+            self.ess_config_data.get(
+                'controller_heartbeat_interval_s',
+                constants.DEFAULT_CONTROLLER_HEARTBEAT_INTERVAL_S,
+            )
+        )
+
+    def send_controller_heartbeat(self):
+        """Publish a lightweight liveness message for the essBATT watchdog.
+
+        Topic/interval come from ess_config.json. Payload is JSON (not retained)
+        so a dead controller does not leave a sticky "alive" message on the broker.
+        """
+        if not self.mqtt_bridge.is_connected:
+            return
+        topic = self._heartbeat_topic()
+        if topic is None:
+            return
+        client = self.mqtt_bridge.client
+        if client is None:
+            return
+        payload = json.dumps({
+            'source': 'essBATT_controller',
+            'vrm_id': self.ess_config_data.get('vrm_id'),
+            'ts': time.time(),
+        })
+        try:
+            client.publish(topic=topic, payload=payload, qos=0, retain=False)
+            self.logger.debug(
+                'Controller heartbeat published on ' + topic + ': ' + payload
+            )
+        except Exception:
+            self.logger.exception(
+                'Failed to publish controller heartbeat on ' + topic
+            )
+
     def print_alive_status_to_logger(self):
         connected = 'connected' if self.mqtt_bridge.is_connected else 'DISCONNECTED'
         self.logger.info(
@@ -448,6 +514,8 @@ class essBATT_controller:
             self.rt_ess_control_update_obj.interval = self.ess_config_data.get(
                 'control_update_rate', 2.0
             )
+        if self.rt_controller_heartbeat_obj is not None:
+            self.rt_controller_heartbeat_obj.interval = self._heartbeat_interval_s()
         self.logger.debug('ess_config.json reloaded while running.')
 
     def reboot_ess_controller_script(self):

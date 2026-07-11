@@ -33,3 +33,10 @@ MULTIS_SWITCH_NUMBER_STRING_MAPPING = {
 # Safe default values when config is missing or incomplete (no magic numbers in business logic)
 DEFAULT_MAX_BATTERY_DISCHARGE_CURRENT = 5.0
 DEFAULT_MAX_BATTERY_CHARGE_CURRENT = 5.0
+
+# Watchdog liveness: controller publishes a small MQTT heartbeat so the
+# independent watchdog can detect controller failure.
+# Interval must stay well below watchdog
+# ``essBATT_controller_timeout_detection_duration`` (default 95s).
+DEFAULT_CONTROLLER_HEARTBEAT_TOPIC = 'essbatt/controller/heartbeat'
+DEFAULT_CONTROLLER_HEARTBEAT_INTERVAL_S = 30.0
