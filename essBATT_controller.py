@@ -108,7 +108,7 @@ class essBATT_controller:
         self.write_base_path = 'W/' + self.ess_config_data.get('vrm_id', 'unknown') + '/'
 
         self.logger.setLevel(
-            constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data.get('debug_level', 'INFO')]
+            constants.resolve_loglevel(self.ess_config_data.get('debug_level', 'INFO'))
         )
         self.logger.info('Effective logger level: ' + str(self.logger.getEffectiveLevel()))
 
@@ -557,7 +557,7 @@ class essBATT_controller:
         self.setpoint_calculator.update_config(new_config)
         self.mqtt_bridge.update_config(new_config)
         self.logger.setLevel(
-            constants.LOGLEVEL_NAME_TO_NUMBER[self.ess_config_data.get('debug_level', 'INFO')]
+            constants.resolve_loglevel(self.ess_config_data.get('debug_level', 'INFO'))
         )
         if self.rt_ess_control_update_obj is not None:
             self.rt_ess_control_update_obj.interval = self.ess_config_data.get(
@@ -568,8 +568,11 @@ class essBATT_controller:
         self.logger.debug('ess_config.json reloaded while running.')
 
     def reboot_ess_controller_script(self):
-        # TODO
-        self.logger.error('Reboot function not yet implemented!')
+        """Request a clean process exit so Docker/systemd can restart us."""
+        self.logger.warning(
+            'Reboot requested via MQTT — shutting down so the process supervisor can restart.'
+        )
+        self._running = False
 
 
 # ======================================================================

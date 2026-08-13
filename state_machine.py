@@ -16,6 +16,33 @@ from datetime import datetime, timedelta
 import numbers
 
 
+def parse_dd_mm(date_str):
+    """Parse a ``DD.MM.`` (optional trailing dot) winter date to ``(month, day)``."""
+    text = str(date_str).strip().rstrip('.')
+    parts = text.split('.')
+    if len(parts) < 2 or parts[0] == '' or parts[1] == '':
+        raise ValueError('winter date must be DD.MM. (got %r)' % (date_str,))
+    day = int(parts[0])
+    month = int(parts[1])
+    datetime(2000, month, day)  # validate day/month (2000 allows 29 Feb)
+    return (month, day)
+
+
+def is_in_winter_window(now, start_date_str, end_date_str):
+    """True if ``now`` falls on a calendar day inside the winter window.
+
+    Both start and end dates are inclusive. A window that wraps the year
+    (e.g. 01.11. … 10.03.) is winter from 1 Nov through 10 Mar. A same-year
+    window (e.g. 01.12. … 31.12.) is winter only between those dates.
+    """
+    start = parse_dd_mm(start_date_str)
+    end = parse_dd_mm(end_date_str)
+    today = (now.month, now.day)
+    if start <= end:
+        return start <= today <= end
+    return today >= start or today <= end
+
+
 class StateMachine:
     def __init__(self, config, logger, controller_state, temporary_script_states, external_input):
         self.config = config
@@ -99,8 +126,14 @@ class StateMachine:
         if self.ess_controller_state['current_state'] == 'balancing':
             return
 
-        if (self.ess_controller_state['winter_mode'] == 'activated' and
-                self.config['winter_mode']['use_winter_mode'] == 1):
+        use_winter_balance = (
+            self.ess_controller_state.get('winter_mode') == 'activated'
+            and self.config.get('winter_mode', {}).get('use_winter_mode') == 1
+            and self.config.get('winter_mode', {}).get(
+                'auto_balancing_settings', {}
+            ).get('use_different_winter_settings', 0) == 1
+        )
+        if use_winter_balance:
             cfg = self.config['winter_mode']['auto_balancing_settings']
         else:
             cfg = self.config['balancing_settings']['auto_balancing_settings']
@@ -132,33 +165,25 @@ class StateMachine:
             return
 
         now = datetime.now(tz=None)
-        year = now.strftime('%Y')
-        next_year = str(int(year) + 1)
-
         try:
-            start = datetime.strptime(self.config['winter_mode']['winter_mode_start_date'] + year, '%d.%m.%Y')
-            end_this = datetime.strptime(self.config['winter_mode']['winter_mode_end_date'] + year, '%d.%m.%Y')
-            end_next = datetime.strptime(self.config['winter_mode']['winter_mode_end_date'] + next_year, '%d.%m.%Y')
-        except ValueError as e:
+            in_winter = is_in_winter_window(
+                now,
+                self.config['winter_mode']['winter_mode_start_date'],
+                self.config['winter_mode']['winter_mode_end_date'],
+            )
+        except (TypeError, ValueError) as e:
             self.logger.error(f'Winter mode dates invalid: {e}')
             return
 
-        if end_this > start:
-            final_end = end_this
-        elif now < end_this:
-            final_end = end_this
+        if in_winter:
+            if self.ess_controller_state['winter_mode'] != 'activated':
+                self.logger.info('Winter is coming! Go into winter mode!')
+                self.ess_controller_state['winter_mode'] = 'activated'
         else:
-            final_end = end_next
-
-        if (now < start < final_end) or (final_start := start) and (now > final_end and final_end < start):
             if self.ess_controller_state['winter_mode'] != 'not_activated':
                 self.logger.info('Winter is gone. Go into summer mode!')
                 self.ess_controller_state['winter_mode'] = 'not_activated'
                 self.reset_winter_mode_states()
-        elif (start < now < final_end) or (final_end < start and now < final_end):
-            if self.ess_controller_state['winter_mode'] != 'activated':
-                self.logger.info('Winter is coming! Go into winter mode!')
-                self.ess_controller_state['winter_mode'] = 'activated'
 
         if 'battery_soc' in local_values:
             # Activate winter SOC discharge limit, or recover timer after script restart
@@ -287,8 +312,11 @@ class StateMachine:
             min_v = local_values['battery_min_cell_voltage']
             max_v = local_values['battery_max_cell_voltage']
             cond = self.config['balancing_settings']['balancing_complete_condition']
+            # 1e-9 absorbs float noise (e.g. 3.49-3.48 > 0.01 in binary).
+            cell_diff = abs(min_v - max_v)
+            max_diff = cond['max_diff_voltage_between_min_and_max_cell']
             if (min_v >= cond['min_cell_voltage_threshold'] and
-                    abs(min_v - max_v) < cond['max_diff_voltage_between_min_and_max_cell']):
+                    cell_diff <= max_diff + 1e-9):
                 self.logger.info('Balancing complete condition met!')
                 self.do_state_update('normal_operation')
                 self.ess_controller_state['time_of_last_completed_balancing'] = datetime.now(tz=None).strftime("%d-%b-%Y (%H:%M:%S.%f)")

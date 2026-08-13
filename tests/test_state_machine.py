@@ -8,7 +8,7 @@ import pytest
 from unittest.mock import MagicMock
 from datetime import datetime, timedelta
 
-from state_machine import StateMachine
+from state_machine import StateMachine, is_in_winter_window, parse_dd_mm
 
 
 @pytest.fixture
@@ -324,6 +324,96 @@ def test_scheduled_start_time_reached(state_machine, sample_controller_state, sa
     assert sample_controller_state["current_state"] == "charge_to_SOC"
 
 
+def test_parse_dd_mm_accepts_trailing_dot():
+    assert parse_dd_mm("01.11.") == (11, 1)
+    assert parse_dd_mm("10.03") == (3, 10)
+
+
+def test_parse_dd_mm_rejects_invalid():
+    with pytest.raises(ValueError):
+        parse_dd_mm("32.01.")
+    with pytest.raises(ValueError):
+        parse_dd_mm("not-a-date")
+
+
+@pytest.mark.parametrize(
+    "now, start, end, expected",
+    [
+        # Year-wrapping window 01.11. … 10.03. (inclusive calendar days)
+        (datetime(2026, 11, 1, 0, 0), "01.11.", "10.03.", True),
+        (datetime(2026, 12, 15, 12, 0), "01.11.", "10.03.", True),
+        (datetime(2026, 2, 1, 8, 0), "01.11.", "10.03.", True),
+        (datetime(2026, 3, 10, 23, 59), "01.11.", "10.03.", True),
+        (datetime(2026, 3, 11, 0, 0), "01.11.", "10.03.", False),
+        (datetime(2026, 8, 13, 12, 0), "01.11.", "10.03.", False),
+        (datetime(2026, 10, 31, 23, 59), "01.11.", "10.03.", False),
+        # Same-year window 01.12. … 31.12.
+        (datetime(2026, 12, 15, 0, 0), "01.12.", "31.12.", True),
+        (datetime(2026, 12, 1, 0, 0), "01.12.", "31.12.", True),
+        (datetime(2026, 12, 31, 12, 0), "01.12.", "31.12.", True),
+        (datetime(2026, 11, 30, 0, 0), "01.12.", "31.12.", False),
+        (datetime(2026, 1, 15, 0, 0), "01.12.", "31.12.", False),
+    ],
+)
+def test_is_in_winter_window(now, start, end, expected):
+    assert is_in_winter_window(now, start, end) is expected
+
+
+def test_auto_balancing_uses_normal_settings_when_winter_flag_off(
+    state_machine, sample_controller_state, sample_config
+):
+    """use_different_winter_settings=0 keeps summer weekday/time even in winter."""
+    today = datetime.now(tz=None)
+    other_weekday = "Monday" if today.strftime("%A") != "Monday" else "Tuesday"
+    sample_config["balancing_settings"]["auto_balancing_settings"] = {
+        "activate_auto_balancing": 1,
+        "weekday": other_weekday,
+        "time": "00:00",
+        "days_to_next_autobalancing": 0,
+    }
+    sample_config["winter_mode"]["use_winter_mode"] = 1
+    sample_config["winter_mode"]["auto_balancing_settings"] = {
+        "use_different_winter_settings": 0,
+        "weekday": today.strftime("%A"),
+        "time": (today - timedelta(minutes=1)).strftime("%H:%M"),
+        "days_to_next_autobalancing": 0,
+    }
+    sample_controller_state["winter_mode"] = "activated"
+    sample_controller_state["time_of_last_completed_balancing"] = (
+        today - timedelta(days=10)
+    ).strftime("%d-%b-%Y (%H:%M:%S.%f)")
+
+    state_machine._handle_auto_balancing()
+    assert sample_controller_state["current_state"] == "normal_operation"
+
+
+def test_auto_balancing_uses_winter_settings_when_flag_on(
+    state_machine, sample_controller_state, sample_config
+):
+    today = datetime.now(tz=None)
+    other_weekday = "Monday" if today.strftime("%A") != "Monday" else "Tuesday"
+    sample_config["balancing_settings"]["auto_balancing_settings"] = {
+        "activate_auto_balancing": 1,
+        "weekday": other_weekday,
+        "time": "00:00",
+        "days_to_next_autobalancing": 0,
+    }
+    sample_config["winter_mode"]["use_winter_mode"] = 1
+    sample_config["winter_mode"]["auto_balancing_settings"] = {
+        "use_different_winter_settings": 1,
+        "weekday": today.strftime("%A"),
+        "time": (today - timedelta(minutes=1)).strftime("%H:%M"),
+        "days_to_next_autobalancing": 0,
+    }
+    sample_controller_state["winter_mode"] = "activated"
+    sample_controller_state["time_of_last_completed_balancing"] = (
+        today - timedelta(days=10)
+    ).strftime("%d-%b-%Y (%H:%M:%S.%f)")
+
+    state_machine._handle_auto_balancing()
+    assert sample_controller_state["current_state"] == "balancing"
+
+
 def test_auto_balancing_triggers(state_machine, sample_controller_state, sample_config):
     """Auto balancing condition (old last + weekday + time) triggers balancing."""
     # Enable
@@ -551,6 +641,22 @@ def test_balancing_complete_condition(state_machine, sample_controller_state):
 
     assert sample_controller_state["current_state"] == "normal_operation"
     assert sample_controller_state["time_of_last_completed_balancing"] != "none"
+
+
+def test_balancing_complete_on_exact_diff(state_machine, sample_controller_state, sample_config):
+    """Documented complete condition is inclusive (<= max_diff)."""
+    sample_config["balancing_settings"]["balancing_complete_condition"] = {
+        "min_cell_voltage_threshold": 3.48,
+        "max_diff_voltage_between_min_and_max_cell": 0.01,
+    }
+    sample_controller_state["current_state"] = "balancing"
+    local = {
+        "all_CCGX_values_available": True,
+        "battery_min_cell_voltage": 3.48,
+        "battery_max_cell_voltage": 3.49,
+    }
+    state_machine._check_transition_back_to_normal(local)
+    assert sample_controller_state["current_state"] == "normal_operation"
 
 
 def test_charge_to_soc_target_reached(state_machine, sample_controller_state):

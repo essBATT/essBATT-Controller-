@@ -500,10 +500,12 @@ def test_cycle_triggers_online_config_reload():
     reload.assert_called_once()
 
 
-# --- reboot stub ---
+# --- reboot ---
 
-def test_reboot_logs_not_implemented():
+def test_reboot_requests_clean_shutdown():
     ctrl, logger = _build_controller()
+    ctrl._running = True
     ctrl.reboot_ess_controller_script()
-    logger.error.assert_called()
-    assert "not yet implemented" in logger.error.call_args.args[0].lower()
+    assert ctrl._running is False
+    logger.warning.assert_called()
+    assert "reboot" in logger.warning.call_args.args[0].lower()

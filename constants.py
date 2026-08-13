@@ -23,6 +23,26 @@ LOGLEVEL_NAME_TO_NUMBER = {
     'CRITICAL': 50, 'FATAL': 50, 'ERROR': 40, 'WARNING': 30, 'WARN': 30,
     'INFO': 20, 'DEBUG': 10, 'NOTSET': 0
 }
+
+
+def resolve_loglevel(name, default='INFO'):
+    """Map a config debug_level string to a logging level number.
+
+    Unknown or empty values fall back to ``default`` (INFO). Comparison is
+    case-insensitive so ``info`` and ``INFO`` both work.
+    """
+    key = str(name if name is not None else default).strip().upper()
+    if key in LOGLEVEL_NAME_TO_NUMBER:
+        return LOGLEVEL_NAME_TO_NUMBER[key]
+    fallback = str(default).strip().upper()
+    return LOGLEVEL_NAME_TO_NUMBER.get(fallback, LOGLEVEL_NAME_TO_NUMBER['INFO'])
+
+
+VRM_ID_PLACEHOLDERS = frozenset({
+    '',
+    'YOUR VRM ID',
+    'unknown',
+})
 MULTIS_SWITCH_NUMBER_STRING_MAPPING = {
     '1': "CHARGER ON INVERTER OFF",
     '2': "INVERTER ON CHARGER OFF",

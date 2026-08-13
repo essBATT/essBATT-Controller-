@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
-from config_manager import ConfigManager
+from config_manager import ConfigManager, validate_ess_config
 
 
 def test_config_manager_init(mocked_logger):
@@ -95,3 +95,105 @@ def test_save_state_if_changed(mocked_logger):
 
     assert changed is True
     manager.save_state.assert_called_once()
+
+
+def test_validate_sample_config_is_ok(sample_config):
+    ok, errors, warnings = validate_ess_config(sample_config)
+    assert ok is True
+    assert errors == []
+    assert sample_config["debug_level"] == "DEBUG"
+
+
+def test_validate_normalizes_lowercase_debug_level(sample_config):
+    sample_config["debug_level"] = "info"
+    ok, errors, warnings = validate_ess_config(sample_config)
+    assert ok is True
+    assert sample_config["debug_level"] == "INFO"
+    assert errors == []
+
+
+def test_validate_unknown_debug_level_falls_back(sample_config):
+    sample_config["debug_level"] = "verbose"
+    ok, errors, warnings = validate_ess_config(sample_config)
+    assert ok is True
+    assert sample_config["debug_level"] == "INFO"
+    assert any("debug_level" in w for w in warnings)
+
+
+def test_validate_placeholder_vrm_id_warns(sample_config):
+    sample_config["vrm_id"] = "YOUR VRM ID"
+    ok, errors, warnings = validate_ess_config(sample_config)
+    assert ok is True
+    assert any("vrm_id" in w for w in warnings)
+
+
+def test_validate_mismatched_charge_arrays_is_error(sample_config):
+    sample_config["battery_settings"]["soc_based_charge_limit_soc_array"] = [80, 90]
+    sample_config["battery_settings"]["soc_based_charge_limit_current_array"] = [25]
+    ok, errors, warnings = validate_ess_config(sample_config)
+    assert ok is False
+    assert any("length" in e for e in errors)
+
+
+def test_validate_unsorted_charge_soc_array_warns(sample_config):
+    sample_config["battery_settings"]["soc_based_charge_limit_soc_array"] = [90, 80, 95]
+    sample_config["battery_settings"]["soc_based_charge_limit_current_array"] = [10, 25, 5]
+    ok, errors, warnings = validate_ess_config(sample_config)
+    assert ok is True
+    assert any("ascending" in w for w in warnings)
+
+
+def test_validate_inverted_charge_resume_is_error(sample_config):
+    sample_config["battery_settings"]["max_cell_voltage_charging"] = 3.50
+    sample_config["battery_settings"]["max_cell_voltage_charging_resume"] = 3.56
+    ok, errors, _warnings = validate_ess_config(sample_config)
+    assert ok is False
+    assert any("charging_resume" in e for e in errors)
+
+
+def test_validate_inverted_discharge_resume_is_error(sample_config):
+    sample_config["battery_settings"]["min_cell_voltage_discharging"] = 3.25
+    sample_config["battery_settings"]["min_cell_voltage_discharging_resume"] = 3.10
+    ok, errors, _warnings = validate_ess_config(sample_config)
+    assert ok is False
+    assert any("discharging_resume" in e for e in errors)
+
+
+def test_validate_winter_soc_order_error_when_enabled(sample_config):
+    sample_config["winter_mode"]["use_winter_mode"] = 1
+    sample_config["winter_mode"]["winter_min_SOC"] = 70
+    sample_config["winter_mode"]["winter_restart_multis_SOC"] = 25
+    ok, errors, _warnings = validate_ess_config(sample_config)
+    assert ok is False
+    assert any("winter_restart_multis_SOC" in e for e in errors)
+
+
+def test_validate_winter_soc_order_warns_when_disabled(sample_config):
+    sample_config["winter_mode"]["use_winter_mode"] = 0
+    sample_config["winter_mode"]["winter_min_SOC"] = 70
+    sample_config["winter_mode"]["winter_restart_multis_SOC"] = 25
+    ok, errors, warnings = validate_ess_config(sample_config)
+    assert ok is True
+    assert errors == []
+    assert any("winter_restart_multis_SOC" in w for w in warnings)
+
+
+def test_validate_invalid_winter_dates_error_when_enabled(sample_config):
+    sample_config["winter_mode"]["use_winter_mode"] = 1
+    sample_config["winter_mode"]["winter_mode_start_date"] = "32.13."
+    ok, errors, _warnings = validate_ess_config(sample_config)
+    assert ok is False
+    assert any("dates" in e for e in errors)
+
+
+def test_load_config_rejects_invalid_file(mocked_logger, temp_config_dir, sample_config):
+    sample_config["battery_settings"]["soc_based_charge_limit_current_array"] = [1]
+    config_path = temp_config_dir["config"]
+    config_path.write_text(json.dumps(sample_config))
+
+    manager = ConfigManager(mocked_logger, debug=False)
+    manager._get_config_path = lambda d, p: config_path
+    data = manager.load_config()
+    assert data == {}
+    assert manager.config_data_loaded_correctly is False
+    mocked_logger.error.assert_called()

@@ -17,6 +17,10 @@ def test_constants_defined():
     assert "3" in constants.MULTIS_SWITCH_NUMBER_STRING_MAPPING
     assert constants.DEFAULT_CONTROLLER_HEARTBEAT_TOPIC == 'essbatt/controller/heartbeat'
     assert constants.DEFAULT_CONTROLLER_HEARTBEAT_INTERVAL_S == 30.0
+    assert constants.resolve_loglevel('info') == 20
+    assert constants.resolve_loglevel('DEBUG') == 10
+    assert constants.resolve_loglevel('nope') == 20
+    assert constants.resolve_loglevel(None) == 20
 
 def test_mapping_values():
     """Check that mappings contain expected values for safety-critical switches."""
