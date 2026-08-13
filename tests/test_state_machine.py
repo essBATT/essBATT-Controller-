@@ -42,7 +42,8 @@ def sample_temporary_states():
         "multi_switch_min_soc_debounce_time": None,
         "winter_mode_multis_switch_off_time": None,
         "winter_mode_inactive_charge_begin_time": None,
-        "emergency_(dis)charge_begin_time": None,
+        "emergency_charge_begin_time": None,
+        "emergency_discharge_begin_time": None,
         "winter_mode_charge_begin_time": None,
         "discharge_current_limit_state": 50.0,
         "discharge_current_limit_hit_zero": False,
@@ -460,7 +461,8 @@ def test_emergency_charge_starts_and_expires(state_machine, sample_controller_st
     state_machine._handle_emergency(local)
     assert sample_controller_state["current_state"] == "charge_to_SOC"
     assert sample_controller_state["charge_to_SOC"]["target_SOC"] == 80
-    assert sample_temporary_states["emergency_(dis)charge_begin_time"] is not None
+    assert sample_temporary_states["emergency_charge_begin_time"] is not None
+    assert sample_temporary_states["emergency_discharge_begin_time"] is None
 
     # Wait out the short duration
     import time
@@ -469,7 +471,70 @@ def test_emergency_charge_starts_and_expires(state_machine, sample_controller_st
     # Call again to expire
     state_machine._handle_emergency(local)
     assert sample_controller_state["current_state"] == "normal_operation"
-    assert sample_temporary_states["emergency_(dis)charge_begin_time"] is None
+    assert sample_temporary_states["emergency_charge_begin_time"] is None
+
+
+def test_emergency_discharge_starts(state_machine, sample_controller_state, sample_temporary_states, sample_config):
+    """High max_cell starts emergency discharge independently of charge."""
+    sample_config["battery_settings"]["emergency_(dis)charge"]["use_emergency_(dis)charging"] = 1
+    sample_config["battery_settings"]["emergency_(dis)charge"]["max_cell_voltage_for_emergency_discharge"] = 3.6
+
+    local = {
+        "all_CCGX_values_available": True,
+        "battery_min_cell_voltage": 3.3,
+        "battery_max_cell_voltage": 3.65,
+    }
+
+    state_machine._handle_emergency(local)
+    assert sample_controller_state["current_state"] == "charge_to_SOC"
+    assert sample_controller_state["charge_to_SOC"]["requested_current_direction"] == "discharge"
+    assert sample_temporary_states["emergency_discharge_begin_time"] is not None
+    assert sample_temporary_states["emergency_charge_begin_time"] is None
+
+
+def test_emergency_discharge_preempts_charge(
+    state_machine, sample_controller_state, sample_temporary_states, sample_config
+):
+    """Overvoltage discharge preempts a running emergency charge."""
+    sample_config["battery_settings"]["emergency_(dis)charge"]["use_emergency_(dis)charging"] = 1
+    sample_config["battery_settings"]["emergency_(dis)charge"]["min_cell_voltage_for_emergency_charge"] = 3.0
+    sample_config["battery_settings"]["emergency_(dis)charge"]["max_cell_voltage_for_emergency_discharge"] = 3.6
+    sample_config["battery_settings"]["emergency_(dis)charge"]["emergency_(dis)charge_duration_minutes"] = 10
+
+    local = {
+        "all_CCGX_values_available": True,
+        "battery_min_cell_voltage": 2.7,
+        "battery_max_cell_voltage": 3.3,
+    }
+    state_machine._handle_emergency(local)
+    assert sample_temporary_states["emergency_charge_begin_time"] is not None
+
+    local["battery_max_cell_voltage"] = 3.65
+    state_machine._handle_emergency(local)
+
+    assert sample_temporary_states["emergency_charge_begin_time"] is None
+    assert sample_temporary_states["emergency_discharge_begin_time"] is not None
+    assert sample_controller_state["charge_to_SOC"]["requested_current_direction"] == "discharge"
+
+
+def test_emergency_both_conditions_prefer_discharge(
+    state_machine, sample_controller_state, sample_temporary_states, sample_config
+):
+    """If both cells are extreme, start discharge (overvoltage priority)."""
+    sample_config["battery_settings"]["emergency_(dis)charge"]["use_emergency_(dis)charging"] = 1
+    sample_config["battery_settings"]["emergency_(dis)charge"]["min_cell_voltage_for_emergency_charge"] = 3.0
+    sample_config["battery_settings"]["emergency_(dis)charge"]["max_cell_voltage_for_emergency_discharge"] = 3.6
+
+    local = {
+        "all_CCGX_values_available": True,
+        "battery_min_cell_voltage": 2.7,
+        "battery_max_cell_voltage": 3.65,
+    }
+    state_machine._handle_emergency(local)
+
+    assert sample_temporary_states["emergency_discharge_begin_time"] is not None
+    assert sample_temporary_states["emergency_charge_begin_time"] is None
+    assert sample_controller_state["charge_to_SOC"]["requested_current_direction"] == "discharge"
 
 
 def test_balancing_complete_condition(state_machine, sample_controller_state):

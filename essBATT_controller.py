@@ -72,6 +72,8 @@ class essBATT_controller:
         self._running = False
         self._timers_started = False
         self._last_disconnect_warn_at = None
+        self._incomplete_data_since = None
+        self._incomplete_data_safe_state_active = False
         self.ess_internal_state = {}
         self.ess_config_data = {}
         self.ess_setvalue_list = {}
@@ -269,6 +271,7 @@ class essBATT_controller:
 
             # --- dynamic path only when all required CCGX fields are present ---
             if local_values.get('all_CCGX_values_available', False):
+                self._clear_incomplete_data_timeout()
                 self.battery_protector.calculate_dis_charge_limits(local_values)
 
                 self.state_machine.multis_switch_handling(local_values)
@@ -294,6 +297,10 @@ class essBATT_controller:
                     set_val=local_values['discharge_power_limit_final'],
                     only_set_if_deviation_to_current_setting=True,
                 )
+            else:
+                # Missing meter/charger/battery fields: do not leave last
+                # Venus setpoints in place forever.
+                self._handle_incomplete_ccgx_data()
 
             # --- persist controller state if it changed this tick ---
             self.cleanup_after_control_loop()
@@ -399,7 +406,48 @@ class essBATT_controller:
             + 'Venus keeps last setpoints until we reassert them.'
         )
 
-    def _apply_software_safe_state(self, reason=''):
+    def _incomplete_data_timeout_s(self):
+        return float(
+            self.ess_config_data.get(
+                'incomplete_data_safe_state_timeout_s',
+                constants.DEFAULT_INCOMPLETE_DATA_SAFE_STATE_TIMEOUT_S,
+            )
+        )
+
+    def _clear_incomplete_data_timeout(self):
+        if self._incomplete_data_safe_state_active:
+            self.logger.info(
+                'CCGX data complete again — leaving incomplete-data software safe state.'
+            )
+        self._incomplete_data_since = None
+        self._incomplete_data_safe_state_active = False
+
+    def _handle_incomplete_ccgx_data(self):
+        """After a timeout, force charge/discharge limits to 0.
+
+        Brief dropouts (grid meter, solarcharger) stay idle so Venus keeps
+        the last setpoints. A sustained gap must not leave those setpoints.
+        """
+        now = time.time()
+        if self._incomplete_data_since is None:
+            self._incomplete_data_since = now
+            self.logger.info(
+                'CCGX data incomplete — starting '
+                + str(self._incomplete_data_timeout_s())
+                + 's software safe-state timeout.'
+            )
+            return
+        elapsed = now - self._incomplete_data_since
+        if elapsed < self._incomplete_data_timeout_s():
+            return
+        reason = 'CCGX data incomplete for ' + str(int(elapsed)) + 's'
+        if not self._incomplete_data_safe_state_active:
+            self._incomplete_data_safe_state_active = True
+            self._apply_software_safe_state(reason=reason)
+        else:
+            self._apply_software_safe_state(reason=reason, quiet=True)
+
+    def _apply_software_safe_state(self, reason='', quiet=False):
         """Best-effort: force charge/discharge limits to 0 while MQTT is up."""
         if not self.mqtt_bridge.is_connected:
             self.logger.error(
@@ -407,7 +455,8 @@ class essBATT_controller:
                 + ') but MQTT is down — cannot publish safe limits.'
             )
             return
-        self.logger.error(
+        log_fn = self.logger.debug if quiet else self.logger.error
+        log_fn(
             'Applying software safe state (' + reason
             + '): MaxChargeCurrent=0, MaxDischargePower=0'
         )

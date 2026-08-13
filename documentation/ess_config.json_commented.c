@@ -10,6 +10,7 @@
     "check_ess_config_changes_while_running": 0, // [values: 0,1] If set to 1 essBATT controller will read this config file each cycle so that you can try out different parameters while the system is running. NOTE: Not all parameters are updated each cycle (ess_mode_2_settings or battery_settings parameters are updated). 
     "keepalive_get_all_topics": 0, // [values: 0,1] Default 0 (recommended for continuous script operation) means, the Victron system only sends the MQTT topics required by essBATT. If set to 1 the Victron system sends out all available topics over MQTT. This is good to investigate all possible data fields, but has very high network load which should be avoided. 
     "control_update_rate": 2.0, // [seconds] Update interval of the essBATT controller
+    "incomplete_data_safe_state_timeout_s": 30.0, // [seconds] If required CCGX fields (battery, grid, loads, solarcharger) stay incomplete this long, essBATT forces MaxChargeCurrent and MaxDischargePower to 0 instead of leaving the last Venus setpoints. Brief dropouts shorter than this timeout stay idle.
     "debug_level": "INFO", //[INFO, DEBUG] In "info" mode only the most important information is printed to the log file. In "debug" mode all information about essBATT operation is printed to the log file.
     "mqtt_username": "YOUR MQTT SERVER USERNAME", // Put the username of your MQTT server here in quotes
     "mqtt_password": "YOUR MQTT SERVER PASSWORD", // Put the password of your MQTT server here e.g. "password123"

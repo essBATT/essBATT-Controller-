@@ -5,6 +5,7 @@
     "check_ess_config_changes_while_running": 0,
     "keepalive_get_all_topics": 0,
     "control_update_rate": 2.0,
+    "incomplete_data_safe_state_timeout_s": 30.0,
     "debug_level": "INFO",
     "mqtt_username": "YOUR MQTT SERVER USERNAME",
     "mqtt_password": "YOUR MQTT SERVER PASSWORD",

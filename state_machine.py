@@ -227,27 +227,57 @@ class StateMachine:
 
         now = datetime.now(tz=None)
         cfg = self.config['battery_settings']['emergency_(dis)charge']
+        duration_s = cfg['emergency_(dis)charge_duration_minutes'] * 60
 
         min_cell = local_values.get('battery_min_cell_voltage')
         max_cell = local_values.get('battery_max_cell_voltage')
-        if min_cell is not None and min_cell <= cfg['min_cell_voltage_for_emergency_charge']:
-            if self.temporary_script_states.get('emergency_(dis)charge_begin_time') is None:
-                self.temporary_script_states['emergency_(dis)charge_begin_time'] = now
-                self.activate_charge_to_SOC_from_script(80, 10, 'charge')
-                self.logger.info(f'"STARTING" emergency charging (min cell {min_cell})')
+        charge_needed = (
+            min_cell is not None
+            and min_cell <= cfg['min_cell_voltage_for_emergency_charge']
+        )
+        discharge_needed = (
+            max_cell is not None
+            and max_cell >= cfg['max_cell_voltage_for_emergency_discharge']
+        )
 
-        if max_cell is not None and max_cell >= cfg['max_cell_voltage_for_emergency_discharge']:
-            if self.temporary_script_states.get('emergency_(dis)charge_begin_time') is None:
-                self.temporary_script_states['emergency_(dis)charge_begin_time'] = now
-                self.activate_charge_to_SOC_from_script(10, 10, 'discharge')
-                self.logger.info(f'"STARTING" emergency discharging (max cell {max_cell})')
+        charge_begin = self.temporary_script_states.get('emergency_charge_begin_time')
+        discharge_begin = self.temporary_script_states.get('emergency_discharge_begin_time')
 
-        begin = self.temporary_script_states.get('emergency_(dis)charge_begin_time')
-        if begin:
-            if (now - begin).total_seconds() > cfg['emergency_(dis)charge_duration_minutes'] * 60:
-                self.temporary_script_states['emergency_(dis)charge_begin_time'] = None
-                self.do_state_update('normal_operation')
-                self.logger.info('"ENDING" emergency (dis)charge')
+        just_ended = False
+        if discharge_begin is not None and (now - discharge_begin).total_seconds() > duration_s:
+            self.temporary_script_states['emergency_discharge_begin_time'] = None
+            discharge_begin = None
+            just_ended = True
+            self.logger.info('"ENDING" emergency discharging')
+        if charge_begin is not None and (now - charge_begin).total_seconds() > duration_s:
+            self.temporary_script_states['emergency_charge_begin_time'] = None
+            charge_begin = None
+            just_ended = True
+            self.logger.info('"ENDING" emergency charging')
+        if just_ended:
+            # Same-tick restart would make the duration a continuous loop.
+            # Next cycle may start again if the condition is still true.
+            self.do_state_update('normal_operation')
+            return
+
+        # Overvoltage (discharge) has priority over undervoltage (charge):
+        # charging a pack with a high cell makes the overvoltage worse.
+        if discharge_needed and discharge_begin is None:
+            if charge_begin is not None:
+                self.temporary_script_states['emergency_charge_begin_time'] = None
+                self.logger.info(
+                    'Emergency charge preempted by emergency discharge '
+                    '(overvoltage has priority)'
+                )
+            self.temporary_script_states['emergency_discharge_begin_time'] = now
+            self.activate_charge_to_SOC_from_script(10, 10, 'discharge')
+            self.logger.info(f'"STARTING" emergency discharging (max cell {max_cell})')
+            return
+
+        if charge_needed and charge_begin is None and discharge_begin is None:
+            self.temporary_script_states['emergency_charge_begin_time'] = now
+            self.activate_charge_to_SOC_from_script(80, 10, 'charge')
+            self.logger.info(f'"STARTING" emergency charging (min cell {min_cell})')
 
     def _check_transition_back_to_normal(self, local_values):
         if not local_values.get('all_CCGX_values_available'):

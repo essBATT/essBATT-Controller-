@@ -40,3 +40,8 @@ DEFAULT_MAX_BATTERY_CHARGE_CURRENT = 5.0
 # ``essBATT_controller_timeout_detection_duration`` (default 95s).
 DEFAULT_CONTROLLER_HEARTBEAT_TOPIC = 'essbatt/controller/heartbeat'
 DEFAULT_CONTROLLER_HEARTBEAT_INTERVAL_S = 30.0
+
+# If required CCGX fields stay incomplete this long, force charge/discharge
+# limits to 0 instead of leaving the last Venus setpoints in place.
+# Brief meter/charger dropouts (a few seconds) are tolerated.
+DEFAULT_INCOMPLETE_DATA_SAFE_STATE_TIMEOUT_S = 30.0

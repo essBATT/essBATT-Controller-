@@ -47,13 +47,32 @@ class VictronOutput:
             self.logger.error('No set value name given!')
             return -1
 
+        if self.mqtt_client is None:
+            self.logger.error(
+                set_val_name_str + ' setpoint sending failed: no MQTT client'
+            )
+            return -1
+
         settings = self.ccgx_data.get('settings', {})
         if set_val_name_str not in settings:
-            return 0
+            # Still try to publish if we know the write path (first-time / cold start)
+            if 'settings_base_path' not in self.ccgx_data:
+                self.logger.warning(
+                    set_val_name_str
+                    + ': cannot publish yet (no settings_base_path / current value)'
+                )
+                return 0
+            current = None
+        else:
+            current = settings[set_val_name_str]
+            if only_set_if_deviation_to_current_setting and set_val == current:
+                return 0
 
-        current = settings[set_val_name_str]
-        if only_set_if_deviation_to_current_setting and set_val == current:
-            return 0
+        if set_val_name_str not in self.setvalue_list:
+            self.logger.error(
+                set_val_name_str + ' not found in ess_setvalue_list.json'
+            )
+            return -1
 
         try:
             topic_str = (
@@ -65,7 +84,8 @@ class VictronOutput:
             self.mqtt_client.publish(topic=topic_str, payload=payload_str, qos=1, retain=0)
             self.logger.debug(
                 set_val_name_str + ': Published ' + payload_str + ' on ' + topic_str
-                + '. settings["' + set_val_name_str + '"]: ' + str(current)
+                + ('' if current is None else
+                   '. settings["' + set_val_name_str + '"]: ' + str(current))
             )
             return 1
         except (TypeError, ValueError, KeyError) as e:
@@ -78,6 +98,10 @@ class VictronOutput:
         Returns:
             True if a publish was attempted, False if no vebus instance / no change
         """
+        if self.mqtt_client is None:
+            self.logger.error('Cannot set Multis switch: no MQTT client')
+            return False
+
         if 'vebus' not in self.ccgx_data:
             return False
 

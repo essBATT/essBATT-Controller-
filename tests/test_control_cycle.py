@@ -332,10 +332,54 @@ def test_cycle_incomplete_ccgx_skips_dynamic_setpoints(cycle_controller):
 
     # Static path still runs
     assert published["MaxFeedInPower"] == 0
-    # Dynamic path skipped — no charge/discharge/setpoint publish
+    # Dynamic path skipped — no charge/discharge/setpoint publish (timeout not elapsed)
     assert "MaxChargeCurrent" not in published
     assert "MaxDischargePower" not in published
     assert "AcPowerSetPoint" not in published
+    assert ctrl._incomplete_data_since is not None
+    assert ctrl._incomplete_data_safe_state_active is False
+
+
+def test_cycle_incomplete_ccgx_after_timeout_applies_safe_state(cycle_controller):
+    """Sustained incomplete CCGX data forces charge/discharge limits to 0."""
+    ctrl, mock_client = cycle_controller
+    del ctrl.CCGX_data["battery"]["soc"]
+    ctrl.ess_config_data["incomplete_data_safe_state_timeout_s"] = 10.0
+
+    with patch("essBATT_controller.time.time", return_value=1000.0):
+        ctrl.ess_control_cycle_update()
+    assert ctrl._incomplete_data_safe_state_active is False
+    mock_client.publish.reset_mock()
+
+    with patch("essBATT_controller.time.time", return_value=1011.0):
+        ctrl.ess_control_cycle_update()
+
+    published = _published_by_leaf(mock_client)
+    assert published.get("MaxChargeCurrent") == 0
+    assert published.get("MaxDischargePower") == 0
+    assert ctrl._incomplete_data_safe_state_active is True
+
+
+def test_cycle_incomplete_clears_when_data_returns(cycle_controller):
+    """Complete snapshot after timeout resets the incomplete-data latch."""
+    ctrl, mock_client = cycle_controller
+    ctrl.ess_config_data["incomplete_data_safe_state_timeout_s"] = 10.0
+    saved_soc = ctrl.CCGX_data["battery"].pop("soc")
+
+    with patch("essBATT_controller.time.time", return_value=1000.0):
+        ctrl.ess_control_cycle_update()
+    with patch("essBATT_controller.time.time", return_value=1011.0):
+        ctrl.ess_control_cycle_update()
+    assert ctrl._incomplete_data_safe_state_active is True
+
+    ctrl.CCGX_data["battery"]["soc"] = saved_soc
+    mock_client.publish.reset_mock()
+    ctrl.ess_control_cycle_update()
+
+    assert ctrl._incomplete_data_since is None
+    assert ctrl._incomplete_data_safe_state_active is False
+    published = _published_by_leaf(mock_client)
+    assert published.get("MaxChargeCurrent") == pytest.approx(40, abs=0.01)
 
 
 def test_cycle_external_deactivate_charge_forces_zero_charge(cycle_controller):

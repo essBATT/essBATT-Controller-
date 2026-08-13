@@ -69,10 +69,32 @@ def test_set_ccgx_value_force_publish_even_if_same(output, mqtt_client):
     mqtt_client.publish.assert_called_once()
 
 
-def test_set_ccgx_value_unknown_setting_no_publish(output, mqtt_client):
-    result = output.set_ccgx_value("DoesNotExist", 1)
-    assert result == 0
+def test_set_ccgx_value_unknown_in_list_returns_error(output, mqtt_client, ccgx_data):
+    ccgx_data["settings"]["DoesNotExist"] = 1
+    result = output.set_ccgx_value("DoesNotExist", 2)
+    assert result == -1
     mqtt_client.publish.assert_not_called()
+
+
+def test_set_ccgx_value_no_mqtt_client(output, mqtt_client):
+    output.mqtt_client = None
+    assert output.set_ccgx_value("AcPowerSetPoint", 10) == -1
+    mqtt_client.publish.assert_not_called()
+
+
+def test_set_ccgx_value_missing_setting_without_base_path(output, mqtt_client, ccgx_data):
+    del ccgx_data["settings_base_path"]
+    del ccgx_data["settings"]["AcPowerSetPoint"]
+    assert output.set_ccgx_value("AcPowerSetPoint", 5) == 0
+    mqtt_client.publish.assert_not_called()
+
+
+def test_set_ccgx_value_cold_start_with_base_path(output, mqtt_client, ccgx_data):
+    """Publish even if current settings value unknown, when base path known."""
+    del ccgx_data["settings"]["AcPowerSetPoint"]
+    result = output.set_ccgx_value("AcPowerSetPoint", 7)
+    assert result == 1
+    mqtt_client.publish.assert_called_once()
 
 
 def test_set_ccgx_value_none_name_returns_error(output, mqtt_client):

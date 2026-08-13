@@ -46,3 +46,21 @@ def test_repeated_timer_callback(mocker):
         # Simulate the _run being called by the timer
         rt._run()  # Direct call for test
         mock_function.assert_called_once_with()
+
+
+def test_repeated_timer_skips_overlapping_run(mocker):
+    """A tick that fires while the previous call is still running is skipped."""
+    release = []
+
+    def blocking_fn():
+        # Re-enter _run while this invocation still holds the lock
+        if not release:
+            release.append(True)
+            rt._run()
+
+    mocker.patch("threading.Timer")
+    mocker.patch("time.time", return_value=100.0)
+    rt = RepeatedTimer(10.0, blocking_fn)
+    rt._run()
+
+    assert rt.overlap_skips == 1

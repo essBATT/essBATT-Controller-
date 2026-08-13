@@ -76,6 +76,8 @@ def test_create_temporary_script_states(sample_config, mocked_logger):
     assert "charge_current_limit_state" in states
     assert "discharge_regular_current_limit_last_cycle" in states
     assert states["discharge_regular_current_limit_last_cycle"] == 0.0
+    assert states["emergency_charge_begin_time"] is None
+    assert states["emergency_discharge_begin_time"] is None
 
 
 def test_save_state_if_changed(mocked_logger):
