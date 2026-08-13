@@ -51,11 +51,12 @@ def test_grid_power(ingestion, ccgx_data):
     assert ccgx_data["grid"]["grid_power_sum"] == -120
 
 
-def test_invalid_payload_clears_device(ingestion, ccgx_data):
+def test_invalid_payload_clears_only_that_field(ingestion, ccgx_data):
     ccgx_data["battery"]["soc"] = 50
+    ccgx_data["battery"]["voltage"] = 52.0
     ingestion.on_battery_soc(_msg("N/vrm/battery/0/Soc", raw_payload=b"not-json"))
-    # device removed clears entire battery dict
-    assert ccgx_data["battery"] == {}
+    assert "soc" not in ccgx_data["battery"]
+    assert ccgx_data["battery"]["voltage"] == 52.0
 
 
 def test_solarcharger_power_creates_instance(ingestion, ccgx_data):
@@ -70,13 +71,13 @@ def test_solarcharger_dc_values(ingestion, ccgx_data):
     assert ccgx_data["solarcharger"]["279"]["Current"] == 8.5
 
 
-def test_solarcharger_removed_clears_only_that_instance(ingestion, ccgx_data):
+def test_solarcharger_removed_deletes_only_that_instance(ingestion, ccgx_data):
     ccgx_data["solarcharger"]["279"] = {"Power": 100}
     ccgx_data["solarcharger"]["280"] = {"Power": 50}
     ingestion.on_solarcharger_power(
         _msg("N/vrm/solarcharger/279/Yield/Power", raw_payload=b"{}")
     )
-    assert ccgx_data["solarcharger"]["279"] == {}
+    assert "279" not in ccgx_data["solarcharger"]
     assert ccgx_data["solarcharger"]["280"]["Power"] == 50
 
 

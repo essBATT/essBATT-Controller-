@@ -61,12 +61,16 @@ class CcgxDataMapper:
             local_values, 'l3_loads_power_consumtpion'
         )
 
-        # Solarchargers: sum power/current; missing fields on known chargers mark incomplete
+        # Solarchargers: sum power/current of chargers still on the bus.
+        # Empty stubs (charger already removed) are ignored. A charger that
+        # is present but missing Power or Current still marks the snapshot incomplete.
         local_values['solarcharger_power_sum'] = 0
         local_values['solarcharger_current_sum'] = 0
         solarchargers = ccgx_data.get('solarcharger', {})
         for element in solarchargers:
             charger = solarchargers[element]
+            if not charger:
+                continue
             if 'Power' in charger:
                 local_values['solarcharger_power_sum'] += charger['Power']
             else:

@@ -9,6 +9,18 @@ No hard dependency on a live MQTT client for the builders — only
 """
 
 
+def is_usable_mqtt_topic(topic):
+    """False for missing, ``none``, or placeholder ``EXAMPLE: ...`` topics."""
+    if topic is None:
+        return False
+    text = str(topic).strip()
+    if text == '' or text == 'none':
+        return False
+    if text.upper().startswith('EXAMPLE:'):
+        return False
+    return True
+
+
 def build_subscription_list(base_path_str, config):
     """Build MQTT subscription list for Victron + optional external control topics.
 
@@ -39,7 +51,7 @@ def build_subscription_list(base_path_str, config):
             'reboot_ess_controller',
         ):
             topic = topics.get(key)
-            if topic and topic != "none":
+            if is_usable_mqtt_topic(topic):
                 subscription_list.append((topic, 1))
 
     return subscription_list
@@ -161,7 +173,7 @@ def build_external_topic_bindings(config, external_handlers):
     topics = ext.get('mqtt_external_control_topics', {})
     for topic_key, handler_name in EXTERNAL_TOPIC_HANDLER_KEYS:
         topic = topics.get(topic_key)
-        if topic and topic != "none":
+        if is_usable_mqtt_topic(topic):
             handler = getattr(external_handlers, handler_name)
             bindings.append((topic, _paho_msg_callback(handler)))
     return bindings

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
-from config_manager import ConfigManager, validate_ess_config
+from config_manager import ConfigManager, validate_ess_config, DEFAULT_CONTROLLER_STATE
 
 
 def test_config_manager_init(mocked_logger):
@@ -43,6 +43,20 @@ def test_load_config_file_not_found(mocked_logger, temp_config_dir):
     assert data == {}
     assert manager.config_data_loaded_correctly is False
     mocked_logger.error.assert_called()
+
+
+def test_load_state_creates_default_when_missing(mocked_logger, temp_config_dir):
+    state_path = temp_config_dir["state"]
+    assert not state_path.exists()
+    manager = ConfigManager(mocked_logger, debug=False)
+    manager._get_config_path = lambda d, p: state_path
+
+    loaded = manager.load_state()
+    assert manager.controller_state_loaded_correctly is True
+    assert loaded["current_state"] == "normal_operation"
+    assert loaded["charge_to_SOC"]["target_SOC"] == "none"
+    assert state_path.exists()
+    assert loaded["ess_controller_state_version"] == DEFAULT_CONTROLLER_STATE["ess_controller_state_version"]
 
 
 def test_load_state_success(sample_ess_controller_state, temp_config_dir, mocked_logger):

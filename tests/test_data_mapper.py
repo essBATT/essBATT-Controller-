@@ -88,6 +88,19 @@ def test_solarcharger_missing_power_marks_incomplete(mapper, full_ccgx_data):
     assert local['all_CCGX_values_available'] is False
 
 
+def test_removed_solarcharger_stub_is_ignored(mapper, full_ccgx_data):
+    """Empty leftover instance must not mark the snapshot incomplete."""
+    full_ccgx_data['solarcharger'] = {
+        '279': {},
+        '280': {'Power': 100, 'Current': 2.0},
+    }
+    local = {}
+    mapper.read_values_to_local_dict(full_ccgx_data, local)
+    assert local['all_CCGX_values_available'] is True
+    assert local['solarcharger_power_sum'] == 100
+    assert local['solarcharger_current_sum'] == 2.0
+
+
 def test_controller_key_contract_for_battery_protector(mapper, full_ccgx_data):
     """Mapped keys must match BatteryProtector REQUIRED_BATTERY_KEYS."""
     from battery_protection import REQUIRED_BATTERY_KEYS

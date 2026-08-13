@@ -40,6 +40,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import signal
+import sys
 import time
 
 import constants
@@ -155,6 +156,7 @@ class essBATT_controller:
             self.ess_config_data,
             self.ingestion,
             self.external_handlers,
+            host=self.ess_config_data.get('mqtt_host', 'localhost'),
             on_connected=self._on_mqtt_connected,
         )
 
@@ -593,9 +595,13 @@ if __name__ == '__main__':
     )
     my_handler.setFormatter(log_formatter)
     my_handler.setLevel(logging.DEBUG)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_formatter)
+    console_handler.setLevel(logging.INFO)
     app_log = logging.getLogger('root')
     app_log.setLevel(logging.INFO)
     app_log.addHandler(my_handler)
+    app_log.addHandler(console_handler)
 
     ess_controller_obj = essBATT_controller(app_log)
 

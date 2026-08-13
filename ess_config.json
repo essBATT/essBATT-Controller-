@@ -7,6 +7,7 @@
     "control_update_rate": 2.0,
     "incomplete_data_safe_state_timeout_s": 30.0,
     "debug_level": "INFO",
+    "mqtt_host": "localhost",
     "mqtt_username": "YOUR MQTT SERVER USERNAME",
     "mqtt_password": "YOUR MQTT SERVER PASSWORD",
     "mqtt_server_COM_port": 1883,

@@ -12,6 +12,7 @@
     "control_update_rate": 2.0, // [seconds] Update interval of the essBATT controller
     "incomplete_data_safe_state_timeout_s": 30.0, // [seconds] If required CCGX fields (battery, grid, loads, solarcharger) stay incomplete this long, essBATT forces MaxChargeCurrent and MaxDischargePower to 0 instead of leaving the last Venus setpoints. Brief dropouts shorter than this timeout stay idle.
     "debug_level": "INFO", //[INFO, DEBUG] In "info" mode only the most important information is printed to the log file. In "debug" mode all information about essBATT operation is printed to the log file.
+    "mqtt_host": "localhost", // MQTT broker hostname or IP. Use localhost when Mosquitto runs on the same machine (Docker host network). On a second Pi (watchdog) put the IP/hostname of the broker Pi here.
     "mqtt_username": "YOUR MQTT SERVER USERNAME", // Put the username of your MQTT server here in quotes
     "mqtt_password": "YOUR MQTT SERVER PASSWORD", // Put the password of your MQTT server here e.g. "password123"
     "mqtt_server_COM_port": 1883, // Give the COM port of your MQTT server
@@ -19,7 +20,7 @@
     // ess_mode_2_settings contain all the values available in Victron ESS Mode 2 PLUS "max_battery_discharge_current". "max_battery_discharge_current" is calculated in essBATT analog to "max_battery_charge_current_2705". The number in the parameter names like "_2705" are the CCGX TCP registers.
     "ess_mode_2_settings":{        
         "grid_power_setpoint_2700": 1, // See CCGX TCP register explantation. See https://www.victronenergy.com/support-and-downloads/technical-information
-        "max_power_fed_to_loads_2704": 5000, // See CCGX TCP register explantation. See https://www.victronenergy.com/support-and-downloads/technical-information
+        "max_power_fed_to_loads_2704": 5000, // NOT WRITTEN by essBATT (no MQTT setvalue mapping). Documented Victron ESS Mode 2 / CCGX TCP register 2704 only. Set this in Venus/VRM if you need it.
         "max_battery_discharge_current": 33, // Not available as a register but works analog to "max_battery_charge_current_2705"
         "max_battery_charge_current_2705": 33, // See CCGX TCP register explantation. See https://www.victronenergy.com/support-and-downloads/technical-information
         "max_system_grid_feed_in_power_2706": 0, // See CCGX TCP register explantation. See https://www.victronenergy.com/support-and-downloads/technical-information
@@ -29,7 +30,7 @@
     "battery_settings":{
         "compensate_current_limit_violations": 0, // DO NOT USE - experimental (sometimes Victron violates charge or discharge limits and current flows to/from the battery even when set to zero)
         "smooth_voltage_based_(dis)charge_limits": 1, // Special behavior for voltage based charge- and discharge limits. Needs more explanation in a seperate documentation. Short: If a voltage based limit is reached it keeps the limit instead of loosing it when the voltage might cross the "limit voltage" again
-        "charge_limit_mode": "max_cell_only", // ["max_cell_only", "soc_only", "soc_and_max_cell"] Max cell only uses soc_based_charge_limit_soc_array and soc_based_charge_limit_current_array. soc_only uses soc_based_charge_limit_soc_array and soc_based_charge_limit_current_array. soc_and_max_cell uses both whichever condition is first met.
+        "charge_limit_mode": "max_cell_only", // ["max_cell_only", "soc_only", "soc_and_max_cell"] max_cell_only uses max_cell_based_charge_limit_voltage_array / max_cell_based_charge_limit_current_array. soc_only uses soc_based_charge_limit_soc_array / soc_based_charge_limit_current_array. soc_and_max_cell uses both and takes the stricter (minimum) current.
         "max_cell_voltage_charging": 3.56, // [volt] If the cell with the maximum voltage reaches the "max_cell_voltage_charging" threshold charging is stopped (charge current=0A).   
         "max_cell_voltage_charging_resume": 3.5, // [volt] If the cell with the maximum voltage falls below "max_cell_voltage_charging_resume" AND previously was above "max_cell_voltage_charging" (charge current = 0A), charging starts again with the set charge current limit
         // Use "soc_based_charge_limit_soc_array" and "soc_based_charge_limit_current_array" to limit the charge current based on the "State Of Charge" (0-100%) of the battery pack.
@@ -120,7 +121,7 @@
         "time_format":"%H:%M", // [https://strftime.org/] To use time based activation of "charge_battery_to_SOC" and "activate_top_balancing_mode" you can specify a time format with the linked syntax. The default time_format given here is used by the time picker in iobroker ?? GUI.
         "date_format":"%d.%m.%Y", // [https://strftime.org/] To use time based activation of "charge_battery_to_SOC" and "activate_top_balancing_mode" you can specify a date format with the linked syntax. The default date_format given here is used by the date picker in iobroker ?? GUI.
         "mqtt_external_control_topics":{
-            "charge_battery_to_SOC": "EXAMPLE: iobroker/ESS_External_Control/activate_charge_to_SOC_command", // put the MQTT topic path where you send the commands here. See extended documentation for the format of the data you need to send
+            "charge_battery_to_SOC": "EXAMPLE: iobroker/ESS_External_Control/activate_charge_to_SOC_command", // put the MQTT topic path where you send the commands here. Topics starting with "EXAMPLE:" or "none" are ignored (not subscribed). See extended documentation for the format of the data you need to send
             "activate_top_balancing_mode": "EXAMPLE: iobroker/ESS_External_Control/activate_balancing_command",  // put the MQTT topic path where you send the commands here. See extended documentation for the format of the data you need to send
             "deactivate_discharge": "EXAMPLE: iobroker/ESS_External_Control/forbid_discharging", // put the MQTT topic path where you send the commands here. See extended documentation for the format of the data you need to send
             "deactivate_charge": "EXAMPLE: iobroker/ESS_External_Control/forbid_charging", // put the MQTT topic path where you send the commands here. See extended documentation for the format of the data you need to send

@@ -13,6 +13,7 @@ from mqtt_helpers import (
     build_ccgx_topic_bindings,
     build_external_topic_bindings,
     register_topic_callbacks,
+    is_usable_mqtt_topic,
 )
 from ccgx_ingestion import CcgxIngestion
 from external_control import ExternalControlHandlers
@@ -79,6 +80,33 @@ def test_subscription_list_skips_none_external_topics():
     assert "iobroker/balance" in topics
     assert "none" not in topics
     assert len(subs) == 7
+
+
+def test_subscription_list_skips_example_placeholder_topics():
+    config = {
+        "external_control_settings": {
+            "allow_external_control_over_mqtt": 1,
+            "mqtt_external_control_topics": {
+                "charge_battery_to_SOC": "EXAMPLE: iobroker/charge",
+                "activate_top_balancing_mode": "iobroker/balance",
+                "deactivate_discharge": "none",
+                "deactivate_charge": "EXAMPLE: iobroker/no_ch",
+                "reboot_ess_controller": "none",
+            },
+        }
+    }
+    topics = [t for t, _ in build_subscription_list("N/vrm1", config)]
+    assert "iobroker/balance" in topics
+    assert not any(t.startswith("EXAMPLE:") for t in topics)
+
+
+def test_is_usable_mqtt_topic():
+    assert is_usable_mqtt_topic("iobroker/charge") is True
+    assert is_usable_mqtt_topic("none") is False
+    assert is_usable_mqtt_topic("EXAMPLE: iobroker/x") is False
+    assert is_usable_mqtt_topic("example: iobroker/x") is False
+    assert is_usable_mqtt_topic("") is False
+    assert is_usable_mqtt_topic(None) is False
 
 
 def test_keepalive_selected_topics_contains_critical_paths():

@@ -14,6 +14,28 @@ from pathlib import Path
 import constants
 
 
+DEFAULT_CONTROLLER_STATE = {
+    'ess_controller_state_version': 1.0,
+    'current_state': 'normal_operation',
+    'time_of_last_change': 'none',
+    'time_of_last_completed_balancing': 'none',
+    'winter_mode': 'not_activated',
+    'winter_SOC_discharge_limit': 'not_activated',
+    'charge_to_SOC': {
+        'activation_time': 'none',
+        'target_SOC': 'none',
+        'max_current': 'none',
+        'requested_current_direction': 'none',
+        'scheduled_start_time': 'none',
+    },
+    'balancing': {
+        'activation_time': 'none',
+        'max_current': 'none',
+        'scheduled_start_time': 'none',
+    },
+}
+
+
 _CHARGE_ARRAY_PAIRS = (
     (
         'soc_based_charge_limit_soc_array',
@@ -242,11 +264,27 @@ class ConfigManager:
         return data
 
     def load_state(self):
-        """Load persistent ess_controller_state file."""
+        """Load persistent ess_controller_state file.
+
+        A missing file is created with a safe default (normal_operation).
+        A present but invalid file is not overwritten.
+        """
+        debug_path = './smarthome_projects/essBATT-Controller-/ess_controller_state'
+        prod_path = './ess_controller_state'
+        state_path = self._get_config_path(debug_path, prod_path)
+        if not state_path.exists():
+            default = copy.deepcopy(DEFAULT_CONTROLLER_STATE)
+            if self.save_state(default):
+                self.logger.warning(
+                    'ess_controller_state missing; created default at ' + str(state_path)
+                )
+                self.controller_state_loaded_correctly = True
+                return default
+            self.controller_state_loaded_correctly = False
+            return {}
+
         data = self._read_json_file(
-            './smarthome_projects/essBATT-Controller-/ess_controller_state',
-            './ess_controller_state',
-            'ess_controller_state'
+            debug_path, prod_path, 'ess_controller_state'
         )
         if data is None:
             self.controller_state_loaded_correctly = False

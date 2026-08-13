@@ -35,7 +35,13 @@ class CcgxIngestion:
         return payload['value']
 
     def device_removed_from_bus(self, topic):
-        """Clear device data when an empty / invalid payload indicates removal."""
+        """Drop a Victron device that left the bus (empty / invalid MQTT payload).
+
+        Solarchargers are stored per instance and must be deleted entirely so
+        the mapper does not treat a leftover ``{}`` as an incomplete charger
+        (night-time MPPT dropout). Other device types use a flat dict and are
+        cleared as a whole.
+        """
         split_topic = topic.split('/')
         try:
             device_type = split_topic[2]
@@ -43,20 +49,31 @@ class CcgxIngestion:
             if device_type != 'solarcharger':
                 self.ccgx_data[device_type] = {}
             else:
-                self.ccgx_data[device_type][device_instance] = {}
+                chargers = self.ccgx_data.setdefault(device_type, {})
+                chargers.pop(device_instance, None)
             self.logger.info(
-                'Received json string without "value". Probably device removed from bus. '
-                'Topic: ' + topic
+                'Device removed from bus — dropped '
+                + device_type + '/' + str(device_instance)
+                + '. Topic: ' + topic
             )
         except (KeyError, IndexError) as e:
             self.logger.error('Deleting device instance due to empty payload failed: ' + str(e))
 
     def _store_simple(self, category, key, msg):
-        """Store json payload value under ccgx_data[category][key], or clear on error."""
+        """Store json payload value under ccgx_data[category][key], or drop that field.
+
+        Invalid/empty payloads clear only ``key``. Wiping the whole device
+        class (e.g. all battery fields) on one bad SOC message would hide
+        still-valid cell voltages from protection logic.
+        """
         try:
             self.ccgx_data[category][key] = json.loads(msg.payload)['value']
         except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-            self.device_removed_from_bus(msg.topic)
+            self.ccgx_data.setdefault(category, {}).pop(key, None)
+            self.logger.info(
+                'Cleared ' + category + '.' + key
+                + ' after invalid/empty MQTT payload. Topic: ' + msg.topic
+            )
 
     # ------------------------------------------------------------------
     # Grid
